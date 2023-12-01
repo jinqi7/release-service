@@ -1,5 +1,5 @@
 /*
-Copyright 2022.
+Copyright 2023.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package releaseplan
+package releaseplanadmission
 
 import (
 	"reflect"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -26,16 +25,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-var _ = Describe("ReleasePlan Controller", Ordered, func() {
-
+var _ = Describe("ReleasePlanAdmission Controller", Ordered, func() {
 	// For the Reconcile function test we don't want to make a successful call as it will call every single operation
 	// defined there. We don't have any control over the operations being executed, and we want to keep a clean env for
 	// the adapter tests.
 	When("Reconcile is called", func() {
-		It("should succeed even if the releasePlan is not found", func() {
+		It("should succeed even if the releasePlanAdmission is not found", func() {
 			controller := &Controller{
 				client: k8sClient,
 				log:    ctrl.Log,

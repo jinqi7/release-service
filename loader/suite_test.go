@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
 	ecapiv1alpha1 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
 	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	"github.com/redhat-appstudio/operator-toolkit/test"
@@ -95,9 +97,11 @@ var _ = BeforeSuite(func() {
 	//+kubebuilder:scaffold:scheme
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:             scheme.Scheme,
-		MetricsBindAddress: "0",
-		LeaderElection:     false,
+		Scheme: scheme.Scheme,
+		Metrics: server.Options{
+			BindAddress: "0", // disables metrics
+		},
+		LeaderElection: false,
 	})
 	Expect(err).NotTo(HaveOccurred())
 
@@ -106,6 +110,7 @@ var _ = BeforeSuite(func() {
 		defer GinkgoRecover()
 
 		Expect(cache.SetupComponentCache(mgr)).To(Succeed())
+		Expect(cache.SetupReleasePlanCache(mgr)).To(Succeed())
 		Expect(cache.SetupReleasePlanAdmissionCache(mgr)).To(Succeed())
 		Expect(cache.SetupSnapshotEnvironmentBindingCache(mgr)).To(Succeed())
 
