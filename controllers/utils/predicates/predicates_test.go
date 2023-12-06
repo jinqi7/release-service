@@ -22,9 +22,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/metadata"
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/metadata"
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"

@@ -20,9 +20,9 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/jinqi7/release-service/metadata"
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 	"github.com/redhat-appstudio/operator-toolkit/conditions"
-	"github.com/redhat-appstudio/release-service/metadata"
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"

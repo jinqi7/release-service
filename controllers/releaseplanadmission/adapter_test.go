@@ -21,13 +21,13 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/loader"
+	"github.com/jinqi7/release-service/metadata"
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	toolkit "github.com/redhat-appstudio/operator-toolkit/loader"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/loader"
-	"github.com/redhat-appstudio/release-service/metadata"
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

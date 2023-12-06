@@ -17,10 +17,10 @@ limitations under the License.
 package controllers
 
 import (
+	"github.com/jinqi7/release-service/controllers/release"
+	"github.com/jinqi7/release-service/controllers/releaseplan"
+	"github.com/jinqi7/release-service/controllers/releaseplanadmission"
 	"github.com/redhat-appstudio/operator-toolkit/controller"
-	"github.com/redhat-appstudio/release-service/controllers/release"
-	"github.com/redhat-appstudio/release-service/controllers/releaseplan"
-	"github.com/redhat-appstudio/release-service/controllers/releaseplanadmission"
 )
 
 // EnabledControllers is a slice containing references to all the controllers that have to be registered

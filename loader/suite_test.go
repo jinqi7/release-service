@@ -25,10 +25,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	ecapiv1alpha1 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
+	appstudiov1alpha1 "github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/cache"
 	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	"github.com/redhat-appstudio/operator-toolkit/test"
-	appstudiov1alpha1 "github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/cache"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 

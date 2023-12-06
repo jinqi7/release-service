@@ -23,7 +23,7 @@ import (
 	"reflect"
 	"strings"
 
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,7 +33,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/api/v1alpha1"
 
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

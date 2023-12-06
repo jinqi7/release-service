@@ -19,15 +19,15 @@ package releaseplan
 import (
 	"reflect"
 
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/loader"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	toolkit "github.com/redhat-appstudio/operator-toolkit/loader"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/loader"
 	"k8s.io/apimachinery/pkg/api/meta"
 
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

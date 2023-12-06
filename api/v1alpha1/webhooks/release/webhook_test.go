@@ -17,7 +17,8 @@ package release
 
 import (
 	"context"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
+
+	"github.com/jinqi7/release-service/api/v1alpha1"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"

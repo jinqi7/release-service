@@ -20,12 +20,13 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	crwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"github.com/jinqi7/release-service/api/v1alpha1/webhooks"
 	"github.com/redhat-appstudio/operator-toolkit/controller"
 	"github.com/redhat-appstudio/operator-toolkit/webhook"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1/webhooks"
 
 	"go.uber.org/zap/zapcore"
 
@@ -45,8 +46,8 @@ import (
 
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 
-	appstudiov1alpha1 "github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/controllers"
+	appstudiov1alpha1 "github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/controllers"
 	//+kubebuilder:scaffold:imports
 )
 

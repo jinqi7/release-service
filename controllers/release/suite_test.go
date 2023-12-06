@@ -18,11 +18,12 @@ package release
 
 import (
 	"context"
-	appstudiov1alpha1 "github.com/redhat-appstudio/release-service/api/v1alpha1"
 	"go/build"
 	"path/filepath"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"testing"
+
+	appstudiov1alpha1 "github.com/jinqi7/release-service/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/redhat-appstudio/operator-toolkit/test"
 
