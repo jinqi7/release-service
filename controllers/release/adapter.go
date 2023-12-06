@@ -24,12 +24,12 @@ import (
 	"github.com/redhat-appstudio/operator-toolkit/controller"
 
 	"github.com/go-logr/logr"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/gitops"
-	"github.com/redhat-appstudio/release-service/loader"
-	"github.com/redhat-appstudio/release-service/metadata"
-	"github.com/redhat-appstudio/release-service/syncer"
-	"github.com/redhat-appstudio/release-service/tekton"
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/gitops"
+	"github.com/jinqi7/release-service/loader"
+	"github.com/jinqi7/release-service/metadata"
+	"github.com/jinqi7/release-service/syncer"
+	"github.com/jinqi7/release-service/tekton"
 
 	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 

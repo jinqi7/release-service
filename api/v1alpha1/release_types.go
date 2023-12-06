@@ -17,10 +17,11 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"github.com/redhat-appstudio/operator-toolkit/conditions"
 	"time"
 
-	"github.com/redhat-appstudio/release-service/metrics"
+	"github.com/redhat-appstudio/operator-toolkit/conditions"
+
+	"github.com/jinqi7/release-service/metrics"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"k8s.io/apimachinery/pkg/api/meta"

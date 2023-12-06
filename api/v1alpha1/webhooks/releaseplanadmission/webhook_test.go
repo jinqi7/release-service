@@ -16,14 +16,14 @@
 package releaseplanadmission
 
 import (
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	tektonutils "github.com/jinqi7/release-service/tekton/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	tektonutils "github.com/redhat-appstudio/release-service/tekton/utils"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/redhat-appstudio/release-service/metadata"
+	"github.com/jinqi7/release-service/metadata"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	//+kubebuilder:scaffold:imports

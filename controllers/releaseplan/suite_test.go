@@ -18,12 +18,13 @@ package releaseplan
 
 import (
 	"context"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
-	"github.com/redhat-appstudio/operator-toolkit/test"
 	"go/build"
 	"path/filepath"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"testing"
+
+	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
+	"github.com/redhat-appstudio/operator-toolkit/test"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"k8s.io/client-go/rest"
 
@@ -32,7 +33,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	appstudiov1alpha1 "github.com/redhat-appstudio/release-service/api/v1alpha1"
+	appstudiov1alpha1 "github.com/jinqi7/release-service/api/v1alpha1"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"

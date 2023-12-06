@@ -21,9 +21,9 @@ import (
 	"reflect"
 
 	"github.com/go-logr/logr"
+	"github.com/jinqi7/release-service/api/v1alpha1"
+	"github.com/jinqi7/release-service/loader"
 	"github.com/redhat-appstudio/operator-toolkit/controller"
-	"github.com/redhat-appstudio/release-service/api/v1alpha1"
-	"github.com/redhat-appstudio/release-service/loader"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
