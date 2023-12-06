@@ -1,4 +1,4 @@
-module github.com/redhat-appstudio/release-service
+module github.com/jinqi7/release-service
 
 go 1.20
 
