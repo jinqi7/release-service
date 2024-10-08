@@ -326,7 +326,7 @@ spec:
         - name: name
           value: clair-scan
         - name: bundle
-          value: quay.io/redhat-appstudio-tekton-catalog/task-clair-scan:0.2@sha256:c19b631df88bdc1099aef127916f440fff933f9616c5177731d12c919bcc76a6
+          value: quay.io/redhat-appstudio-tekton-catalog/task-clair-scan:0.2@sha256:cf9edf8ae0dbf7597a9d47bd1865f84d1e900f033057ecd7e2946ac5fce351d3
         - name: kind
           value: task
         resolver: bundles
@@ -382,6 +382,27 @@ spec:
         operator: in
         values:
         - "false"
+    - name: rpms-signature-scan
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values: ["false"]
+      runAfter:
+        - build-container
+      taskRef:
+        resolver: bundles
+        params:
+        - name: name
+          value: rpms-signature-scan
+        - name: bundle
+          value: quay.io/konflux-ci/tekton-catalog/task-rpms-signature-scan:0.2@sha256:7aa4d3c95e2b963e82fdda392f7cb3d61e3dab035416cf4a3a34e43cf3c9c9b8
+        - name: kind
+          value: task
+      params:
+      - name: image-url
+        value: $(tasks.build-container.results.IMAGE_URL)
+      - name: image-digest
+        value: $(tasks.build-container.results.IMAGE_DIGEST)
     workspaces:
     - name: workspace
     - name: git-auth
