@@ -1,28 +1,15 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: egress-controller-manager
+  name: allow-all-ports
+  namespace: default
 spec:
-  podSelector:
-    matchLabels:
-      control-plane: controller-manager
+  podSelector: {}
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 1-65535
+        - protocol: UDP
+          port: 1-65535
   policyTypes:
-  - Egress
-  egress:
-    - to:
-      - namespaceSelector: {}
-        podSelector:
-          matchLabels:
-            apiserver: "true"
-            app: openshift-kube-apiserver
-      ports:
-        - port: 6443
-          protocol: TCP
-    - to:
-      - ipBlock:
-          cidr: 172.20.0.1/32  # CIDR of Kubernetes API Endpoint.
-      ports:
-        - port: 6443
-          protocol: TCP
-        - port: 443
-          protocol: TCP
+    - Egress
