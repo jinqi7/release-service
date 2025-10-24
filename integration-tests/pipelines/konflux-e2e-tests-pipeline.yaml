@@ -69,6 +69,8 @@ spec:
           value: $(params.SNAPSHOT)
         - name: test-name
           value: $(context.pipelineRun.name)
+      runAfter:
+        - check-if-e2e-irrelevant
     - name: provision-kind-cluster
       runAfter:
         - test-metadata
