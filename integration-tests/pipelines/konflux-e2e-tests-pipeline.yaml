@@ -44,12 +44,6 @@ spec:
       default: 'none'
       description: 'Container image built from any konflux git repo. Use this param only when you run Konflux e2e tests
         in another Konflux component repo. Will pass the component built image from the snapshot.'
-    - name: enable-sealights
-      description: "A flag to enable or disable the Sealights integration feature. When set to 'true', test results are sent to Sealights for analysis; otherwise, this feature is skipped."
-      default: "false"
-    - name: enable-sl-plugin
-      description: "Enable Sealights ginkgo plugin to scan the e2e tests that will report to Sealights."
-      default: "true"
   tasks:
     - name: check-if-e2e-irrelevant
       taskRef:
@@ -61,23 +55,6 @@ spec:
             value: main
           - name: pathInRepo
             value: tasks/check-if-e2e-irrelevant/0.1/check-if-e2e-irrelevant.yaml
-    - name: sealights-refs
-      when:
-        - input: "$(tasks.check-if-e2e-irrelevant.results.result)"
-          operator: in
-          values: ["false"]
-      taskRef:
-        resolver: git
-        params:
-          - name: url
-            value: https://github.com/konflux-ci/tekton-integration-catalog.git
-          - name: revision
-            value: main
-          - name: pathInRepo
-            value: tasks/sealights/sealights-get-refs/0.1/sealights-get-refs.yaml
-      params:
-        - name: SNAPSHOT
-          value: $(params.SNAPSHOT)
     - name: test-metadata
       when:
         - input: "$(tasks.check-if-e2e-irrelevant.results.result)"
@@ -97,9 +74,10 @@ spec:
           value: $(params.SNAPSHOT)
         - name: test-name
           value: $(context.pipelineRun.name)
+      runAfter:
+        - check-if-e2e-irrelevant
     - name: provision-kind-cluster
       runAfter:
-        - sealights-refs
         - test-metadata
       when:
         - input: "$(tasks.check-if-e2e-irrelevant.results.result)"
@@ -181,9 +159,9 @@ spec:
         - name: credentials-secret-name
           value: $(params.konflux-test-infra-secret)
         - name: component-image-repository
-          value: $(tasks.sealights-refs.results.sealights-container-repo)
+          value: $(tasks.test-metadata.results.container-repo)
         - name: component-image-tag
-          value: $(tasks.sealights-refs.results.sealights-container-tag)
+          value: $(tasks.test-metadata.results.container-tag)
         - name: oci-credentials
           value: konflux-test-infra
         - name: build-credentials
@@ -225,15 +203,7 @@ spec:
         - name: job-spec
           value: "$(tasks.test-metadata.results.job-spec)"
         - name: component-image
-          value: $(tasks.sealights-refs.results.sealights-container-image)
-        - name: sealights-bsid
-          value: $(tasks.sealights-refs.results.sealights-bsid)
-        - name: test-stage
-          value: $(params.test-stage)
-        - name: enable-sealights
-          value: $(params.enable-sealights)
-        - name: enable-sl-plugin
-          value: $(params.enable-sl-plugin)
+          value: $(tasks.test-metadata.results.container-image)
         - name: cluster-access-secret-name
           value: kfg-$(context.pipelineRun.name)
         - name: test-environment
