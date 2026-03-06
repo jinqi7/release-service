@@ -5,6 +5,8 @@ on:
       - opened
       - synchronize
       - reopened
+  merge_group:
+    types: [checks_requested]
 jobs:
   go:
     name: Check sources
@@ -13,15 +15,15 @@ jobs:
       OPERATOR_SDK_VERSION: v1.39.1
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v5
         with:
           fetch-depth: 0
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
           go-version-file: go.mod
       - name: Cache Operator SDK ${{ env.OPERATOR_SDK_VERSION }}
-        uses: actions/cache@v4
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
         id: cache-operator-sdk
         with:
           path: ~/cache
@@ -43,7 +45,7 @@ jobs:
           make kustomize controller-gen
       - name: Cache go modules
         id: cache-mod
-        uses: actions/cache@v4
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
@@ -71,9 +73,9 @@ jobs:
             git --no-pager diff ':(exclude)bin/kustomize' ':(exclude)bin/controller-gen'
             exit 1
           fi
-      - uses: dominikh/staticcheck-action@v1.3.1
+      - uses: dominikh/staticcheck-action@024238d2898c874f26d723e7d0ff4308c35589a2 # v1.4.0
         with:
-          version: "2024.1.1"
+          version: "2025.1.1"
           install-go: false
       - name: Check manifests
         run: |
@@ -93,7 +95,10 @@ jobs:
       - name: Run Go Tests
         run: make test
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
+        with:
+          flags: unit-tests
+          token: ${{ secrets.CODECOV_TOKEN }}
       - name: Ensure make build succeeds
         run: make build
       - name: Ensure make bundle succeeds
@@ -103,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v5
         with:
           fetch-depth: 0
       - name: Check if dockerimage build is working
@@ -113,10 +118,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
       - name: Install gitlint into container
         run: |
           python3 -m venv venv
@@ -125,4 +130,15 @@ jobs:
       - name: Run gitlint check
         run: |
           source venv/bin/activate
-          gitlint --commits origin/${{ github.event.pull_request.base.ref }}..HEAD
+          RAW_BASE_REF="${{ github.base_ref || github.event.merge_group.base_ref }}"
+          BASE_REF="${RAW_BASE_REF#refs/heads/}"
+          echo "Base ref: $BASE_REF"
+          git fetch origin "$BASE_REF"
+          gitlint --commits "origin/$BASE_REF"..HEAD
+  check-renovate-config-file:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: konflux-ci/renovate-config-validator-action@main
+        with:
+          config_file: renovate.json

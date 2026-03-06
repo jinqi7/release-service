@@ -18,12 +18,10 @@ package releaseplan
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"github.com/konflux-ci/release-service/metadata"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -36,9 +34,7 @@ type Webhook struct {
 }
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type.
-func (w *Webhook) Default(ctx context.Context, obj runtime.Object) error {
-	releasePlan := obj.(*v1alpha1.ReleasePlan)
-
+func (w *Webhook) Default(ctx context.Context, releasePlan *v1alpha1.ReleasePlan) error {
 	if _, found := releasePlan.GetLabels()[metadata.AutoReleaseLabel]; !found {
 		if releasePlan.Labels == nil {
 			releasePlan.Labels = map[string]string{
@@ -58,36 +54,25 @@ func (w *Webhook) Register(mgr ctrl.Manager, log *logr.Logger) error {
 	w.client = mgr.GetClient()
 	w.log = log.WithName("releasePlan")
 
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&v1alpha1.ReleasePlan{}).
+	return ctrl.NewWebhookManagedBy(mgr, &v1alpha1.ReleasePlan{}).
 		WithDefaulter(w).
 		WithValidator(w).
 		Complete()
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	return w.validateAutoReleaseLabel(obj)
-}
-
-// ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	return w.validateAutoReleaseLabel(newObj)
-}
-
-// ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
+// Validation is handled by CRD schema (maxLength, pattern) and CEL rules (mutual exclusivity).
+func (w *Webhook) ValidateCreate(ctx context.Context, releasePlan *v1alpha1.ReleasePlan) (warnings admission.Warnings, err error) {
 	return nil, nil
 }
 
-// validateAutoReleaseLabel throws an error if the auto-release label value is set to anything besides true or false.
-func (w *Webhook) validateAutoReleaseLabel(obj runtime.Object) (warnings admission.Warnings, err error) {
-	releasePlan := obj.(*v1alpha1.ReleasePlan)
+// ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
+// Validation is handled by CRD schema (maxLength, pattern) and CEL rules (mutual exclusivity).
+func (w *Webhook) ValidateUpdate(ctx context.Context, oldReleasePlan, newReleasePlan *v1alpha1.ReleasePlan) (warnings admission.Warnings, err error) {
+	return nil, nil
+}
 
-	if value, found := releasePlan.GetLabels()[metadata.AutoReleaseLabel]; found {
-		if value != "true" && value != "false" {
-			return nil, fmt.Errorf("'%s' label can only be set to true or false", metadata.AutoReleaseLabel)
-		}
-	}
+// ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
+func (w *Webhook) ValidateDelete(ctx context.Context, releasePlan *v1alpha1.ReleasePlan) (warnings admission.Warnings, err error) {
 	return nil, nil
 }

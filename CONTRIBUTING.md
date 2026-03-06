@@ -4,7 +4,7 @@ Contributions of all kinds are welcome. In particular pull requests are apprecia
 
 ## Code of Conduct
 
-Our [company values](https://www.redhat.com/en/about/brand/standards/culture) guide us in our day-to-day interactions and decision-making. Our open source projects are no exception and they will define the standards for how to engage with the project through a [code of conduct](CODE_OF_CONDUCT.md). 
+Our [company values](https://www.redhat.com/en/about/brand/standards/culture) guide us in our day-to-day interactions and decision-making. Our open source projects are no exception and they will define the standards for how to engage with the project through a [code of conduct](CODE_OF_CONDUCT.md).
 
 Please, make sure you read both of them before contributing, so you can help us to maintain a healthy community.
 
@@ -62,11 +62,6 @@ Overall explanation of what this commit is achieving and the motivation behind i
 Signed-off-by: Your Name <your-name@your-email.com>
 ```
 
-### Signing commits
-
-This project also enforces GPG signed commits. More information on commit signing and how to do it can be found in the [git official docs](
-https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work) or in [this GitHub guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits). You can see whether or not the commit was successfully signed by the `Verified` bubble next to your commit in the GitHub UI or using `git log`.
-
 ### Pull Requests
 
 All changes must come from a pull request (PR) and cannot be directly committed. While anyone can engage in activity on a PR, pull requests are only approved by team members.
@@ -90,7 +85,7 @@ Tests are written using the *[Ginkgo](https://onsi.github.io/ginkgo/)* framework
 * Start the descriptions of `It` blocks in lowercase and try to be as descriptive as possible
 * Avoid ignoring errors. In other words, make sure all of them are caught and tested
 * Files ending with `_suite_test.go` are meant to store the code that is common for tests in the same directory and that will be executed before them. Use these files only if your test setup is big enough to justify it (ie. the suite file has more than the test suite name and the teardown)
-* When required, remember to add the `CRD`'s during the `envtest` setup, for instance: [release-service/release_suite_test.go at main · redhat-appstudio/release-service · GitHub](https://github.com/konflux-ci/release-service/blob/main/controllers/release/release_suite_test.go#L65) - remembering this saves a lot of time
+* When required, remember to add the required CRDs during the `envtest` setup. See the [suite_test.go](https://github.com/konflux-ci/release-service/blob/main/controllers/release/suite_test.go#L70-L91) file for an example of how to configure `CRDDirectoryPaths` in the test environment. This setup is essential for tests to run properly and can save significant debugging time
 * After `Create()` or `Update()` objects, use `Get()` before making assurances as the object might be outdated. It is useful after `Delete()` to check if the client returns `errors.IsNotFound`
 * Some assurances are likely to require usage of `Eventually` blocks instead of or in addition to `Expect` blocks
 

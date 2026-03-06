@@ -22,11 +22,11 @@ import (
 	"reflect"
 
 	"github.com/konflux-ci/release-service/loader"
+	"github.com/konflux-ci/release-service/metadata"
 
 	"github.com/go-logr/logr"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -40,8 +40,15 @@ type Webhook struct {
 }
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type.
-func (w *Webhook) Default(ctx context.Context, obj runtime.Object) error {
-	release := obj.(*v1alpha1.Release)
+func (w *Webhook) Default(ctx context.Context, release *v1alpha1.Release) error {
+	// Initialize labels map if nil
+	if release.Labels == nil {
+		release.Labels = make(map[string]string)
+	}
+
+	// Set snapshot and releasePlan labels from spec fields
+	release.Labels[metadata.SnapshotLabel] = release.Spec.Snapshot
+	release.Labels[metadata.ReleasePlanLabel] = release.Spec.ReleasePlan
 
 	if release.Spec.GracePeriodDays != 0 {
 		return nil
@@ -70,31 +77,48 @@ func (w *Webhook) Register(mgr ctrl.Manager, log *logr.Logger) error {
 	w.loader = loader.NewLoader()
 	w.log = log.WithName("release")
 
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&v1alpha1.Release{}).
+	return ctrl.NewWebhookManagedBy(mgr, &v1alpha1.Release{}).
 		WithDefaulter(w).
 		WithValidator(w).
 		Complete()
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (w *Webhook) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
+func (w *Webhook) ValidateCreate(ctx context.Context, release *v1alpha1.Release) (warnings admission.Warnings, err error) {
+	// Validate that resource names used as labels don't exceed Kubernetes label value limit (63 characters)
+	if len(release.Name) > 63 {
+		return nil, fmt.Errorf("release name must be no more than 63 characters, got %d characters", len(release.Name))
+	}
+	if len(release.Spec.Snapshot) > 63 {
+		return nil, fmt.Errorf("snapshot name must be no more than 63 characters, got %d characters", len(release.Spec.Snapshot))
+	}
+	if len(release.Spec.ReleasePlan) > 63 {
+		return nil, fmt.Errorf("releasePlan name must be no more than 63 characters, got %d characters", len(release.Spec.ReleasePlan))
+	}
+
 	return nil, nil
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (w *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	oldRelease := oldObj.(*v1alpha1.Release)
-	newRelease := newObj.(*v1alpha1.Release)
-
+func (w *Webhook) ValidateUpdate(ctx context.Context, oldRelease, newRelease *v1alpha1.Release) (warnings admission.Warnings, err error) {
 	if !reflect.DeepEqual(newRelease.Spec, oldRelease.Spec) {
 		return nil, fmt.Errorf("release resources spec cannot be updated")
+	}
+
+	// Validate snapshot label immutability
+	if oldRelease.Labels[metadata.SnapshotLabel] != newRelease.Labels[metadata.SnapshotLabel] {
+		return nil, fmt.Errorf("release snapshot label cannot be updated")
+	}
+
+	// Validate releasePlan label immutability
+	if oldRelease.Labels[metadata.ReleasePlanLabel] != newRelease.Labels[metadata.ReleasePlanLabel] {
+		return nil, fmt.Errorf("release releasePlan label cannot be updated")
 	}
 
 	return nil, nil
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type
-func (w *Webhook) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
+func (w *Webhook) ValidateDelete(ctx context.Context, release *v1alpha1.Release) (warnings admission.Warnings, err error) {
 	return nil, nil
 }

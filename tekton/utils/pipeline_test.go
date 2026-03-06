@@ -17,12 +17,15 @@ limitations under the License.
 package utils
 
 import (
+	"reflect"
+	"time"
+
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
-
-	"reflect"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var _ = Describe("Pipeline", func() {
@@ -137,12 +140,71 @@ var _ = Describe("Pipeline", func() {
 		})
 	})
 
-	When("GetTektonParams method is called", func() {
-		It("should return a tekton Param list", func() {
-			parameterizedPipeline := ParameterizedPipeline{}
-			parameterizedPipeline.Params = []Param{
-				{Name: "parameter1", Value: "value1"},
-				{Name: "parameter2", Value: "value2"},
+	When("GetOciStorageParam method is called", func() {
+		It("should return ociStorage param when set on PipelineRef", func() {
+			pipelineRef := PipelineRef{
+				Resolver: "git",
+				Params: []Param{
+					{Name: "url", Value: "my-git-url"},
+				},
+				OciStorage: "quay.io/my-org/storage",
+			}
+
+			params := pipelineRef.GetOciStorageParam()
+			Expect(params).To(HaveLen(1))
+			Expect(reflect.TypeOf(params[0])).To(Equal(reflect.TypeOf(tektonv1.Param{})))
+			Expect(params[0].Name).To(Equal("ociStorage"))
+			Expect(params[0].Value.StringVal).To(Equal("quay.io/my-org/storage"))
+		})
+
+		It("should return ociStorage param for Pipeline via PipelineRef", func() {
+			pipeline := Pipeline{
+				PipelineRef: PipelineRef{
+					Resolver: "git",
+					Params: []Param{
+						{Name: "url", Value: "my-git-url"},
+					},
+					OciStorage: "quay.io/my-org/storage",
+				},
+			}
+
+			params := pipeline.GetOciStorageParam()
+			Expect(params).To(HaveLen(1))
+			Expect(reflect.TypeOf(params[0])).To(Equal(reflect.TypeOf(tektonv1.Param{})))
+			Expect(params[0].Name).To(Equal("ociStorage"))
+			Expect(params[0].Value.StringVal).To(Equal("quay.io/my-org/storage"))
+		})
+
+		It("should return an empty list when PipelineRef has no ociStorage", func() {
+			pipeline := Pipeline{
+				PipelineRef: PipelineRef{
+					Resolver: "git",
+					Params: []Param{
+						{Name: "url", Value: "my-git-url"},
+					},
+				},
+			}
+			params := pipeline.GetOciStorageParam()
+			Expect(params).To(BeEmpty())
+		})
+	})
+
+	When("GetTektonParams method is called on ParameterizedPipeline", func() {
+		It("should return a tekton Param list for ParameterizedPipeline using its own Params field", func() {
+			// ParameterizedPipeline uses its own Params field (for TenantPipeline/FinalPipeline)
+			parameterizedPipeline := ParameterizedPipeline{
+				Pipeline: Pipeline{
+					PipelineRef: PipelineRef{
+						Resolver: "git",
+						Params: []Param{
+							{Name: "url", Value: "my-git-url"},
+						},
+					},
+				},
+				Params: []Param{
+					{Name: "parameter1", Value: "value1"},
+					{Name: "parameter2", Value: "value2"},
+				},
 			}
 
 			params := parameterizedPipeline.GetTektonParams()
@@ -153,6 +215,21 @@ var _ = Describe("Pipeline", func() {
 			Expect(reflect.TypeOf(params[1])).To(Equal(reflect.TypeOf(tektonv1.Param{})))
 			Expect(params[1].Name).To(Equal("parameter2"))
 			Expect(params[1].Value.StringVal).To(Equal("value2"))
+		})
+
+		It("should return an empty list when ParameterizedPipeline has no params", func() {
+			parameterizedPipeline := ParameterizedPipeline{
+				Pipeline: Pipeline{
+					PipelineRef: PipelineRef{
+						Resolver: "git",
+						Params: []Param{
+							{Name: "url", Value: "my-git-url"},
+						},
+					},
+				},
+			}
+			params := parameterizedPipeline.GetTektonParams()
+			Expect(params).To(BeEmpty())
 		})
 	})
 
@@ -166,5 +243,97 @@ var _ = Describe("Pipeline", func() {
 			Expect(bundleRef.IsClusterScoped()).To(BeFalse())
 		})
 	})
-
 })
+
+var _ = Describe("AdjustTimeouts", func() {
+	var logger logr.Logger
+
+	BeforeEach(func() {
+		logger = logr.Discard() // Use a no-op logger for tests
+	})
+
+	dur := func(d time.Duration) *metav1.Duration {
+		return &metav1.Duration{Duration: d}
+	}
+
+	DescribeTable("should adjust timeouts correctly",
+		func(input *tektonv1.TimeoutFields, expectedPipeline, expectedTasks, expectedFinally *time.Duration) {
+			result := AdjustTimeouts(input, logger)
+
+			if expectedPipeline == nil && expectedTasks == nil && expectedFinally == nil {
+				// Expect empty struct or nil
+				if result != nil {
+					Expect(*result).To(Equal(tektonv1.TimeoutFields{}))
+				}
+				return
+			}
+
+			Expect(result).NotTo(BeNil())
+			if expectedPipeline != nil {
+				Expect(result.Pipeline).NotTo(BeNil())
+				Expect(result.Pipeline.Duration).To(Equal(*expectedPipeline))
+			}
+			if expectedTasks != nil {
+				Expect(result.Tasks).NotTo(BeNil())
+				Expect(result.Tasks.Duration).To(Equal(*expectedTasks))
+			}
+			if expectedFinally != nil {
+				Expect(result.Finally).NotTo(BeNil())
+				Expect(result.Finally.Duration).To(Equal(*expectedFinally))
+			}
+		},
+		Entry("nil timeouts returns nil",
+			nil, nil, nil, nil),
+
+		Entry("all unset returns original",
+			&tektonv1.TimeoutFields{}, nil, nil, nil),
+
+		Entry("only pipeline (30m) sets tasks to pipeline - 10m",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), nil),
+
+		Entry("only pipeline (10m < 20m) sets tasks to pipeline/2",
+			&tektonv1.TimeoutFields{Pipeline: dur(10 * time.Minute)},
+			ptr(10*time.Minute), ptr(5*time.Minute), nil),
+
+		Entry("only tasks sets pipeline to tasks + 10m",
+			&tektonv1.TimeoutFields{Tasks: dur(20 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), nil),
+
+		Entry("only finally returns empty struct",
+			&tektonv1.TimeoutFields{Finally: dur(5 * time.Minute)},
+			nil, nil, nil),
+
+		Entry("pipeline + tasks valid (tasks < pipeline) returns original",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Tasks: dur(20 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), nil),
+
+		Entry("pipeline + tasks invalid (tasks >= pipeline) adjusts tasks",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Tasks: dur(30 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), nil),
+
+		Entry("pipeline + finally (finally <= pipeline/2) sets tasks = pipeline - finally",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Finally: dur(10 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), ptr(10*time.Minute)),
+
+		Entry("pipeline + finally (finally > pipeline/2) adjusts tasks and finally",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Finally: dur(20 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), ptr(10*time.Minute)),
+
+		Entry("tasks + finally sets pipeline = tasks + finally",
+			&tektonv1.TimeoutFields{Tasks: dur(20 * time.Minute), Finally: dur(10 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), ptr(10*time.Minute)),
+
+		Entry("all three valid returns original",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Tasks: dur(20 * time.Minute), Finally: dur(10 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), ptr(10*time.Minute)),
+
+		Entry("all three invalid adjusts tasks and finally",
+			&tektonv1.TimeoutFields{Pipeline: dur(30 * time.Minute), Tasks: dur(25 * time.Minute), Finally: dur(10 * time.Minute)},
+			ptr(30*time.Minute), ptr(20*time.Minute), ptr(10*time.Minute)),
+	)
+})
+
+func ptr(d time.Duration) *time.Duration {
+	return &d
+}

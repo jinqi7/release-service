@@ -70,16 +70,7 @@ var _ = Describe("ReleasePlan webhook", func() {
 		})
 	})
 
-	When("a ReleasePlan is created with an invalid auto-release label value", func() {
-		It("should get rejected until the value is valid", func() {
-			releasePlan.Labels = map[string]string{metadata.AutoReleaseLabel: "foo"}
-			err := k8sClient.Create(ctx, releasePlan)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.AutoReleaseLabel))
-		})
-	})
-
-	When("a ReleasePlan is created with a valid auto-release label value", func() {
+	When("a ReleasePlan is created with an auto-release label value", func() {
 		It("shouldn't be modified", func() {
 			// Using value "true"
 			localReleasePlan := releasePlan.DeepCopy()
@@ -115,20 +106,70 @@ var _ = Describe("ReleasePlan webhook", func() {
 		})
 	})
 
-	When("a ReleasePlan is updated using an invalid auto-release label value", func() {
-		It("shouldn't be modified", func() {
-			Expect(k8sClient.Create(ctx, releasePlan)).Should(Succeed())
-			releasePlan.GetLabels()[metadata.AutoReleaseLabel] = "foo"
-			err := k8sClient.Update(ctx, releasePlan)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.AutoReleaseLabel))
-		})
-	})
-
 	When("ValidateDelete method is called", func() {
 		It("should return nil", func() {
 			releasePlan := &v1alpha1.ReleasePlan{}
 			Expect(webhook.ValidateDelete(ctx, releasePlan)).To(BeNil())
+		})
+	})
+
+	When("a ReleasePlan is created with an application name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			releasePlan.Spec.Application = "this-is-a-very-long-application-name-that-exceeds-sixty-three-chars"
+			err := k8sClient.Create(ctx, releasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spec.application"))
+			Expect(err.Error()).To(ContainSubstring("Too long"))
+		})
+	})
+
+	When("a ReleasePlan is updated with an application name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			Expect(k8sClient.Create(ctx, releasePlan)).Should(Succeed())
+			releasePlan.Spec.Application = "this-is-a-very-long-application-name-that-exceeds-sixty-three-chars"
+			err := k8sClient.Update(ctx, releasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spec.application"))
+			Expect(err.Error()).To(ContainSubstring("Too long"))
+		})
+	})
+
+	When("a ReleasePlan is created with a componentGroup name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			releasePlan.Spec.Application = ""
+			releasePlan.Spec.ComponentGroup = "this-is-a-very-long-component-group-name-that-exceeds-sixty-three-chars"
+			err := k8sClient.Create(ctx, releasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spec.componentGroup"))
+			Expect(err.Error()).To(ContainSubstring("Too long"))
+		})
+	})
+
+	When("a ReleasePlan is created with both application and componentGroup", func() {
+		It("should be rejected", func() {
+			releasePlan.Spec.Application = "app"
+			releasePlan.Spec.ComponentGroup = "group"
+			err := k8sClient.Create(ctx, releasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of application or componentGroup must be specified"))
+		})
+	})
+
+	When("a ReleasePlan is created with neither application nor componentGroup", func() {
+		It("should be rejected", func() {
+			releasePlan.Spec.Application = ""
+			releasePlan.Spec.ComponentGroup = ""
+			err := k8sClient.Create(ctx, releasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of application or componentGroup must be specified"))
+		})
+	})
+
+	When("a ReleasePlan is created with only componentGroup", func() {
+		It("should succeed", func() {
+			releasePlan.Spec.Application = ""
+			releasePlan.Spec.ComponentGroup = "my-component-group"
+			Expect(k8sClient.Create(ctx, releasePlan)).Should(Succeed())
 		})
 	})
 })

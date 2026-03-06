@@ -23,7 +23,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"github.com/konflux-ci/release-service/metadata"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -36,14 +35,14 @@ type Webhook struct {
 }
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type.
-func (w *Webhook) Default(ctx context.Context, obj runtime.Object) error {
-	releasePlanAdmission := obj.(*v1alpha1.ReleasePlanAdmission)
-
-	if _, found := releasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]; !found {
+func (w *Webhook) Default(ctx context.Context, releasePlanAdmission *v1alpha1.ReleasePlanAdmission) error {
+	if _, found := releasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel]; !found {
 		if releasePlanAdmission.Labels == nil {
 			releasePlanAdmission.Labels = map[string]string{
-				metadata.AutoReleaseLabel: "true",
+				metadata.BlockReleasesLabel: "false",
 			}
+		} else {
+			releasePlanAdmission.Labels[metadata.BlockReleasesLabel] = "false"
 		}
 	}
 
@@ -58,35 +57,56 @@ func (w *Webhook) Register(mgr ctrl.Manager, log *logr.Logger) error {
 	w.client = mgr.GetClient()
 	w.log = log.WithName("releasePlanAdmission")
 
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&v1alpha1.ReleasePlanAdmission{}).
+	return ctrl.NewWebhookManagedBy(mgr, &v1alpha1.ReleasePlanAdmission{}).
 		WithDefaulter(w).
 		WithValidator(w).
 		Complete()
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	return w.validateAutoReleaseLabel(obj)
+func (w *Webhook) ValidateCreate(ctx context.Context, rpa *v1alpha1.ReleasePlanAdmission) (warnings admission.Warnings, err error) {
+	if err := w.validateSpec(rpa); err != nil {
+		return nil, err
+	}
+	return w.validateBlockReleasesLabel(rpa)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	return w.validateAutoReleaseLabel(newObj)
+func (w *Webhook) ValidateUpdate(ctx context.Context, oldRpa, newRpa *v1alpha1.ReleasePlanAdmission) (warnings admission.Warnings, err error) {
+	if err := w.validateSpec(newRpa); err != nil {
+		return nil, err
+	}
+	return w.validateBlockReleasesLabel(newRpa)
+}
+
+// validateSpec validates the length of application and componentGroup names.
+// Mutual exclusivity is handled by CRD CEL rules.
+func (w *Webhook) validateSpec(rpa *v1alpha1.ReleasePlanAdmission) error {
+	for _, app := range rpa.Spec.Applications {
+		if len(app) > 63 {
+			return fmt.Errorf("application name '%s' must be no more than 63 characters, got %d characters", app, len(app))
+		}
+	}
+
+	for _, cg := range rpa.Spec.ComponentGroups {
+		if len(cg) > 63 {
+			return fmt.Errorf("componentGroup name '%s' must be no more than 63 characters, got %d characters", cg, len(cg))
+		}
+	}
+
+	return nil
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (w *Webhook) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
+func (w *Webhook) ValidateDelete(ctx context.Context, rpa *v1alpha1.ReleasePlanAdmission) (warnings admission.Warnings, err error) {
 	return nil, nil
 }
 
-// validateAutoReleaseLabel throws an error if the auto-release label value is set to anything besides true or false.
-func (w *Webhook) validateAutoReleaseLabel(obj runtime.Object) (warnings admission.Warnings, err error) {
-	releasePlanAdmission := obj.(*v1alpha1.ReleasePlanAdmission)
-
-	if value, found := releasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]; found {
+// validateBlockReleasesLabel throws an error if the block-releases label value is set to anything besides true or false.
+func (w *Webhook) validateBlockReleasesLabel(rpa *v1alpha1.ReleasePlanAdmission) (warnings admission.Warnings, err error) {
+	if value, found := rpa.GetLabels()[metadata.BlockReleasesLabel]; found {
 		if value != "true" && value != "false" {
-			return nil, fmt.Errorf("'%s' label can only be set to true or false", metadata.AutoReleaseLabel)
+			return nil, fmt.Errorf("'%s' label can only be set to true or false", metadata.BlockReleasesLabel)
 		}
 	}
 	return nil, nil

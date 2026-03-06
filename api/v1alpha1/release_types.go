@@ -134,6 +134,24 @@ type CollectorsInfo struct {
 	TenantCollectorsProcessing PipelineInfo `json:"tenantCollectorsProcessing,omitempty"`
 }
 
+// RoleBindingType defines the state of roleBindings for resource access within the Release pipelineRun.
+type RoleBindingType struct {
+	// TenantRoleBinding contains the namespaced name of the roleBinding created for accessing resources within the tenant namespace.
+	// +kubebuilder:validation:Pattern=^[a-z0-9]([-a-z0-9]*[a-z0-9])?\/[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+	// +optional
+	TenantRoleBinding string `json:"tenantRoleBinding,omitempty"`
+
+	// ManagedRoleBinding contains the namespaced name of the roleBinding created for accessing resources within the managed namespace.
+	// +kubebuilder:validation:Pattern=^[a-z0-9]([-a-z0-9]*[a-z0-9])?\/[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+	// +optional
+	ManagedRoleBinding string `json:"managedRoleBinding,omitempty"`
+
+	// SecretRoleBinding contains the namespaced name of the roleBinding created for accessing secrets within the namespace.
+	// +kubebuilder:validation:Pattern=^[a-z0-9]([-a-z0-9]*[a-z0-9])?\/[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+	// +optional
+	SecretRoleBinding string `json:"secretRoleBinding,omitempty"`
+}
+
 // PipelineInfo defines the observed state of a release pipeline processing.
 type PipelineInfo struct {
 	// CompletionTime is the time when the Release processing was completed
@@ -145,11 +163,10 @@ type PipelineInfo struct {
 	// +optional
 	PipelineRun string `json:"pipelineRun,omitempty"`
 
-	// RoleBinding contains the namespaced name of the roleBinding created for the managed Release PipelineRun
-	// executed as part of this release
-	// +kubebuilder:validation:Pattern=^[a-z0-9]([-a-z0-9]*[a-z0-9])?\/[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+	// RoleBindings defines the roleBindings for accessing resources during the Release
+	// PipelineRun executed as part of this release.
 	// +optional
-	RoleBinding string `json:"roleBinding,omitempty"`
+	RoleBindings RoleBindingType `json:"roleBindings,omitempty"`
 
 	// StartTime is the time when the Release processing started
 	// +optional
@@ -213,6 +230,18 @@ func (r *Release) HasReleaseFinished() bool {
 	return r.hasPhaseFinished(releasedConditionType)
 }
 
+// AreAllProcessingPhasesFinished returns true when all processing phases (tenant collectors,
+// managed collectors, tenant, managed, and final) have finished, regardless of result or skip.
+// This should be used to gate any stop operation in the release adapter, or else we risk leaving
+// lingering resources around as the release would be ended before cleanups may run.
+func (r *Release) AreAllProcessingPhasesFinished() bool {
+	return r.HasTenantCollectorsPipelineProcessingFinished() &&
+		r.HasManagedCollectorsPipelineProcessingFinished() &&
+		r.HasTenantPipelineProcessingFinished() &&
+		r.HasManagedPipelineProcessingFinished() &&
+		r.HasFinalPipelineProcessingFinished()
+}
+
 // IsAttributed checks whether the Release was marked as attributed.
 func (r *Release) IsAttributed() bool {
 	return r.Status.Attribution.Author != ""
@@ -223,28 +252,28 @@ func (r *Release) IsAutomated() bool {
 	return r.Status.Automated
 }
 
-// IsFinalPipelineProcessed checks whether the Release Final Pipeline was successfully processed.
-func (r *Release) IsFinalPipelineProcessed() bool {
+// IsFinalPipelineProcessedSuccessfully checks whether the Release Final Pipeline was successfully processed.
+func (r *Release) IsFinalPipelineProcessedSuccessfully() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, finalProcessedConditionType.String())
 }
 
-// IsManagedCollectorsPipelineProcessed checks whether the Release Managed Collectors Pipeline was successfully processed.
-func (r *Release) IsManagedCollectorsPipelineProcessed() bool {
+// IsManagedCollectorsPipelineProcessedSuccessfully checks whether the Release Managed Collectors Pipeline was successfully processed.
+func (r *Release) IsManagedCollectorsPipelineProcessedSuccessfully() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, managedCollectorsProcessedConditionType.String())
 }
 
-// IsManagedPipelineProcessed checks whether the Release Managed Pipeline was successfully processed.
-func (r *Release) IsManagedPipelineProcessed() bool {
+// IsManagedPipelineProcessedSuccessfully checks whether the Release Managed Pipeline was successfully processed.
+func (r *Release) IsManagedPipelineProcessedSuccessfully() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, managedProcessedConditionType.String())
 }
 
-// IsTenantCollectorsPipelineProcessed checks whether the Release Tenant Collectors Pipeline was successfully processed.
-func (r *Release) IsTenantCollectorsPipelineProcessed() bool {
+// IsTenantCollectorsPipelineProcessedSuccessfully checks whether the Release Tenant Collectors Pipeline was successfully processed.
+func (r *Release) IsTenantCollectorsPipelineProcessedSuccessfully() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, tenantCollectorsProcessedConditionType.String())
 }
 
-// IsTenantPipelineProcessed checks whether the Release Tenant Pipeline was successfully processed.
-func (r *Release) IsTenantPipelineProcessed() bool {
+// IsTenantPipelineProcessedSuccessfully checks whether the Release Tenant Pipeline was successfully processed.
+func (r *Release) IsTenantPipelineProcessedSuccessfully() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, tenantProcessedConditionType.String())
 }
 
@@ -273,6 +302,31 @@ func (r *Release) IsTenantPipelineProcessing() bool {
 	return r.isPhaseProgressing(tenantProcessedConditionType)
 }
 
+// IsFinalPipelineSkipped checks whether the Release Final Pipeline processing was skipped.
+func (r *Release) IsFinalPipelineSkipped() bool {
+	return r.isPhaseSkipped(finalProcessedConditionType)
+}
+
+// IsManagedCollectorsPipelineSkipped checks whether the Release Managed Collectors Pipeline was skipped.
+func (r *Release) IsManagedCollectorsPipelineSkipped() bool {
+	return r.isPhaseSkipped(managedCollectorsProcessedConditionType)
+}
+
+// IsManagedPipelineSkipped checks whether the Release Managed Pipeline processing was skipped.
+func (r *Release) IsManagedPipelineSkipped() bool {
+	return r.isPhaseSkipped(managedProcessedConditionType)
+}
+
+// IsTenantCollectorsPipelineSkipped checks whether the Release Tenant Collectors Pipeline was skipped.
+func (r *Release) IsTenantCollectorsPipelineSkipped() bool {
+	return r.isPhaseSkipped(tenantCollectorsProcessedConditionType)
+}
+
+// IsTenantPipelineSkipped checks whether the Release Tenant Pipeline was skipped.
+func (r *Release) IsTenantPipelineSkipped() bool {
+	return r.isPhaseSkipped(tenantProcessedConditionType)
+}
+
 // IsReleased checks whether the Release has finished successfully.
 func (r *Release) IsReleased() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, releasedConditionType.String())
@@ -286,6 +340,12 @@ func (r *Release) IsReleasing() bool {
 // IsValid checks whether the Release validation has finished successfully.
 func (r *Release) IsValid() bool {
 	return meta.IsStatusConditionTrue(r.Status.Conditions, validatedConditionType.String())
+}
+
+// IsFailed checks whether the Release has failed.
+func (r *Release) IsFailed() bool {
+	condition := meta.FindStatusCondition(r.Status.Conditions, releasedConditionType.String())
+	return condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == FailedReason.String()
 }
 
 // MarkFinalPipelineProcessed marks the Release Final Pipeline as processed.
@@ -302,7 +362,7 @@ func (r *Release) MarkFinalPipelineProcessed() {
 		r.Status.FinalProcessing.CompletionTime,
 		SucceededReason.String(),
 		r.Status.Target,
-		metadata.FinalPipelineType,
+		metadata.FinalPipelineType.String(),
 	)
 }
 
@@ -320,7 +380,7 @@ func (r *Release) MarkManagedCollectorsPipelineProcessed() {
 		r.Status.CollectorsProcessing.ManagedCollectorsProcessing.CompletionTime,
 		SucceededReason.String(),
 		r.Status.Target,
-		metadata.ManagedCollectorsPipelineType,
+		metadata.ManagedCollectorsPipelineType.String(),
 	)
 }
 
@@ -338,7 +398,7 @@ func (r *Release) MarkManagedPipelineProcessed() {
 		r.Status.ManagedProcessing.CompletionTime,
 		SucceededReason.String(),
 		r.Status.Target,
-		metadata.ManagedPipelineType,
+		metadata.ManagedPipelineType.String(),
 	)
 }
 
@@ -356,7 +416,7 @@ func (r *Release) MarkTenantCollectorsPipelineProcessed() {
 		r.Status.CollectorsProcessing.TenantCollectorsProcessing.CompletionTime,
 		SucceededReason.String(),
 		r.Status.Target,
-		metadata.TenantCollectorsPipelineType,
+		metadata.TenantCollectorsPipelineType.String(),
 	)
 }
 
@@ -374,7 +434,7 @@ func (r *Release) MarkTenantPipelineProcessed() {
 		r.Status.TenantProcessing.CompletionTime,
 		SucceededReason.String(),
 		r.Status.Target,
-		metadata.TenantPipelineType,
+		metadata.TenantPipelineType.String(),
 	)
 }
 
@@ -395,7 +455,7 @@ func (r *Release) MarkFinalPipelineProcessing() {
 		r.Status.FinalProcessing.StartTime,
 		ProgressingReason.String(),
 		r.Status.Target,
-		metadata.FinalPipelineType,
+		metadata.FinalPipelineType.String(),
 	)
 }
 
@@ -416,7 +476,7 @@ func (r *Release) MarkManagedCollectorsPipelineProcessing() {
 		r.Status.CollectorsProcessing.ManagedCollectorsProcessing.StartTime,
 		ProgressingReason.String(),
 		r.Status.Target,
-		metadata.ManagedPipelineType,
+		metadata.ManagedPipelineType.String(),
 	)
 }
 
@@ -437,7 +497,7 @@ func (r *Release) MarkManagedPipelineProcessing() {
 		r.Status.ManagedProcessing.StartTime,
 		ProgressingReason.String(),
 		r.Status.Target,
-		metadata.ManagedPipelineType,
+		metadata.ManagedPipelineType.String(),
 	)
 }
 
@@ -458,7 +518,7 @@ func (r *Release) MarkTenantCollectorsPipelineProcessing() {
 		r.Status.CollectorsProcessing.TenantCollectorsProcessing.StartTime,
 		ProgressingReason.String(),
 		r.Status.Target,
-		metadata.TenantCollectorsPipelineType,
+		metadata.TenantCollectorsPipelineType.String(),
 	)
 }
 
@@ -479,7 +539,7 @@ func (r *Release) MarkTenantPipelineProcessing() {
 		r.Status.TenantProcessing.StartTime,
 		ProgressingReason.String(),
 		r.Status.Target,
-		metadata.TenantPipelineType,
+		metadata.TenantPipelineType.String(),
 	)
 }
 
@@ -497,7 +557,7 @@ func (r *Release) MarkFinalPipelineProcessingFailed(message string) {
 		r.Status.FinalProcessing.CompletionTime,
 		FailedReason.String(),
 		r.Status.Target,
-		metadata.FinalPipelineType,
+		metadata.FinalPipelineType.String(),
 	)
 }
 
@@ -515,7 +575,7 @@ func (r *Release) MarkManagedCollectorsPipelineProcessingFailed(message string) 
 		r.Status.CollectorsProcessing.ManagedCollectorsProcessing.CompletionTime,
 		FailedReason.String(),
 		r.Status.Target,
-		metadata.ManagedCollectorsPipelineType,
+		metadata.ManagedCollectorsPipelineType.String(),
 	)
 }
 
@@ -533,7 +593,7 @@ func (r *Release) MarkManagedPipelineProcessingFailed(message string) {
 		r.Status.ManagedProcessing.CompletionTime,
 		FailedReason.String(),
 		r.Status.Target,
-		metadata.ManagedPipelineType,
+		metadata.ManagedPipelineType.String(),
 	)
 }
 
@@ -551,7 +611,7 @@ func (r *Release) MarkTenantCollectorsPipelineProcessingFailed(message string) {
 		r.Status.CollectorsProcessing.TenantCollectorsProcessing.CompletionTime,
 		FailedReason.String(),
 		r.Status.Target,
-		metadata.TenantCollectorsPipelineType,
+		metadata.TenantCollectorsPipelineType.String(),
 	)
 }
 
@@ -569,7 +629,7 @@ func (r *Release) MarkTenantPipelineProcessingFailed(message string) {
 		r.Status.TenantProcessing.CompletionTime,
 		FailedReason.String(),
 		r.Status.Target,
-		metadata.TenantPipelineType,
+		metadata.TenantPipelineType.String(),
 	)
 }
 
@@ -766,6 +826,12 @@ func (r *Release) isPhaseProgressing(conditionType conditions.ConditionType) boo
 	default:
 		return condition.Status == metav1.ConditionFalse && condition.Reason == ProgressingReason.String()
 	}
+}
+
+// isPhaseSkipped checks whether a Release phase was skipped.
+func (r *Release) isPhaseSkipped(conditionType conditions.ConditionType) bool {
+	condition := meta.FindStatusCondition(r.Status.Conditions, conditionType.String())
+	return condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason == SkippedReason.String()
 }
 
 // +kubebuilder:object:root=true

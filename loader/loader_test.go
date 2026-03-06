@@ -1,6 +1,7 @@
 package loader
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"strings"
@@ -8,13 +9,13 @@ import (
 
 	tektonutils "github.com/konflux-ci/release-service/tekton/utils"
 
-	ecapiv1alpha1 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
+	ecapiv1alpha1 "github.com/conforma/crds/api/v1alpha1"
+	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"github.com/konflux-ci/release-service/metadata"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gstruct"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
@@ -65,19 +66,19 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			Expect(returnedObject.Name).To(Equal(releasePlanAdmission.Name))
 		})
 
-		It("fails to return an active release plan admission if the auto release label is set to false", func() {
+		It("fails to return an active release plan admission if the block releases label is set to true", func() {
 			// Use a new application for this test so we don't have timing issues
 			disabledReleasePlanAdmission := releasePlanAdmission.DeepCopy()
-			disabledReleasePlanAdmission.Labels[metadata.AutoReleaseLabel] = "false"
+			disabledReleasePlanAdmission.Labels[metadata.BlockReleasesLabel] = "true"
 			disabledReleasePlanAdmission.Name = "disabled-release-plan-admission"
-			disabledReleasePlanAdmission.Spec.Applications = []string{"auto-release-test"}
+			disabledReleasePlanAdmission.Spec.Applications = []string{"block-releases-test"}
 			disabledReleasePlanAdmission.ResourceVersion = ""
 			Expect(k8sClient.Create(ctx, disabledReleasePlanAdmission)).To(Succeed())
-			releasePlan.Spec.Application = "auto-release-test"
+			releasePlan.Spec.Application = "block-releases-test"
 
 			Eventually(func() bool {
 				returnedObject, err := loader.GetActiveReleasePlanAdmission(ctx, k8sClient, releasePlan)
-				return returnedObject == nil && err != nil && strings.Contains(err.Error(), "with auto-release label set to false")
+				return returnedObject == nil && err != nil && strings.Contains(err.Error(), "with block-releases label set to false")
 			})
 
 			releasePlan.Spec.Application = application.Name
@@ -178,6 +179,30 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			Expect(returnedObject).To(BeNil())
 		})
 
+		It("fails to return a ReleasePlanAdmission from ReleasePlan label when targeted RPA has incorrect origin", func() {
+			modifiedReleasePlan := releasePlan.DeepCopy()
+			modifiedReleasePlan.Labels = map[string]string{
+				metadata.ReleasePlanAdmissionLabel: "new-release-plan-admission",
+			}
+
+			newReleasePlanAdmission := releasePlanAdmission.DeepCopy()
+			newReleasePlanAdmission.Name = "new-release-plan-admission"
+			newReleasePlanAdmission.ResourceVersion = ""
+			newReleasePlanAdmission.Spec.Origin = "non-existent-origin"
+			Expect(k8sClient.Create(ctx, newReleasePlanAdmission)).To(Succeed())
+			// Wait until the new releasePlanAdmission is cached
+			Eventually(func() error {
+				return k8sClient.Get(ctx, client.ObjectKey{Name: newReleasePlanAdmission.Name, Namespace: newReleasePlanAdmission.Namespace}, newReleasePlanAdmission)
+			}).Should(Succeed())
+
+			returnedObject, err := loader.GetMatchingReleasePlanAdmission(ctx, k8sClient, modifiedReleasePlan)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("does not match the namespace"))
+			Expect(returnedObject).To(BeNil())
+
+			Expect(k8sClient.Delete(ctx, newReleasePlanAdmission)).To(Succeed())
+		})
+
 		It("fails to return a release plan admission if the target does not match", func() {
 			modifiedReleasePlan := releasePlan.DeepCopy()
 			modifiedReleasePlan.Spec.Target = "non-existent-target"
@@ -211,10 +236,106 @@ var _ = Describe("Release Adapter", Ordered, func() {
 
 			Expect(k8sClient.Delete(ctx, newReleasePlanAdmission)).To(Succeed())
 		})
+
+		It("returns a release plan admission when RP uses componentGroup and RPA uses componentGroups", func() {
+			cgReleasePlan := &v1alpha1.ReleasePlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cg-release-plan",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ReleasePlanSpec{
+					ComponentGroup: "my-component-group",
+					Target:         "default",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cgReleasePlan)).To(Succeed())
+
+			cgReleasePlanAdmission := &v1alpha1.ReleasePlanAdmission{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cg-release-plan-admission",
+					Namespace: "default",
+					Labels: map[string]string{
+						metadata.BlockReleasesLabel: "false",
+					},
+				},
+				Spec: v1alpha1.ReleasePlanAdmissionSpec{
+					ComponentGroups: []string{"my-component-group"},
+					Origin:          "default",
+					Pipeline: &tektonutils.Pipeline{
+						PipelineRef: tektonutils.PipelineRef{
+							Resolver: "bundles",
+							Params: []tektonutils.Param{
+								{Name: "bundle", Value: "testbundle"},
+								{Name: "name", Value: "release-pipeline"},
+								{Name: "kind", Value: "pipeline"},
+							},
+						},
+					},
+					Policy: enterpriseContractPolicy.Name,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cgReleasePlanAdmission)).To(Succeed())
+
+			Eventually(func() bool {
+				returnedObject, err := loader.GetMatchingReleasePlanAdmission(ctx, k8sClient, cgReleasePlan)
+				return err == nil && returnedObject != nil && returnedObject.Name == cgReleasePlanAdmission.Name
+			}).Should(BeTrue())
+
+			Expect(k8sClient.Delete(ctx, cgReleasePlan)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cgReleasePlanAdmission)).To(Succeed())
+		})
+
+		It("returns a release plan admission when RP uses application and RPA uses componentGroups (backward compatible)", func() {
+			appReleasePlan := &v1alpha1.ReleasePlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "app-to-cg-release-plan",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ReleasePlanSpec{
+					Application: "cross-match-app",
+					Target:      "default",
+				},
+			}
+			Expect(k8sClient.Create(ctx, appReleasePlan)).To(Succeed())
+
+			cgReleasePlanAdmission := &v1alpha1.ReleasePlanAdmission{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cg-for-app-rpa",
+					Namespace: "default",
+					Labels: map[string]string{
+						metadata.BlockReleasesLabel: "false",
+					},
+				},
+				Spec: v1alpha1.ReleasePlanAdmissionSpec{
+					ComponentGroups: []string{"cross-match-app"},
+					Origin:          "default",
+					Pipeline: &tektonutils.Pipeline{
+						PipelineRef: tektonutils.PipelineRef{
+							Resolver: "bundles",
+							Params: []tektonutils.Param{
+								{Name: "bundle", Value: "testbundle"},
+								{Name: "name", Value: "release-pipeline"},
+								{Name: "kind", Value: "pipeline"},
+							},
+						},
+					},
+					Policy: enterpriseContractPolicy.Name,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cgReleasePlanAdmission)).To(Succeed())
+
+			Eventually(func() bool {
+				returnedObject, err := loader.GetMatchingReleasePlanAdmission(ctx, k8sClient, appReleasePlan)
+				return err == nil && returnedObject != nil && returnedObject.Name == cgReleasePlanAdmission.Name
+			}).Should(BeTrue())
+
+			Expect(k8sClient.Delete(ctx, appReleasePlan)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cgReleasePlanAdmission)).To(Succeed())
+		})
 	})
 
 	When("calling GetMatchingReleasePlans", func() {
-		var releasePlanTwo, releasePlanDiffApp *v1alpha1.ReleasePlan
+		var releasePlanTwo, releasePlanDiffApp, releasePlanWithLabel *v1alpha1.ReleasePlan
 
 		BeforeEach(func() {
 			releasePlanTwo = releasePlan.DeepCopy()
@@ -224,20 +345,49 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			releasePlanDiffApp.Name = "rp-diff"
 			releasePlanDiffApp.Spec.Application = "some-other-app"
 			releasePlanDiffApp.ResourceVersion = ""
+			releasePlanWithLabel = releasePlan.DeepCopy()
+			releasePlanWithLabel.Name = "rp-with-label"
+			releasePlanWithLabel.Labels = map[string]string{
+				metadata.ReleasePlanAdmissionLabel: releasePlanAdmission.Name,
+			}
+			releasePlanWithLabel.ResourceVersion = ""
 			Expect(k8sClient.Create(ctx, releasePlanTwo)).To(Succeed())
 			Expect(k8sClient.Create(ctx, releasePlanDiffApp)).To(Succeed())
+			Expect(k8sClient.Create(ctx, releasePlanWithLabel)).To(Succeed())
 		})
 
 		AfterEach(func() {
 			Expect(k8sClient.Delete(ctx, releasePlanTwo)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, releasePlanDiffApp)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, releasePlanWithLabel)).To(Succeed())
 		})
 
-		It("returns the requested list of release plans", func() {
+		It("returns only ReleasePlans with matching label when label exists", func() {
 			Eventually(func() bool {
 				returnedObject, err := loader.GetMatchingReleasePlans(ctx, k8sClient, releasePlanAdmission)
+				return returnedObject != &v1alpha1.ReleasePlanList{} && err == nil && len(returnedObject.Items) == 1
+			}).Should(BeTrue())
+		})
+
+		It("returns ReleasePlan with matching label even when other ReleasePlans exist", func() {
+			Eventually(func() bool {
+				returnedObject, err := loader.GetMatchingReleasePlans(ctx, k8sClient, releasePlanAdmission)
+				return returnedObject.Items[0].Name == releasePlanWithLabel.Name && err == nil && len(returnedObject.Items) == 1
+			}).Should(BeTrue())
+		})
+
+		It("falls back to all ReleasePlans when no label matches", func() {
+			unmatchedReleasePlanAdmission := releasePlanAdmission.DeepCopy()
+			unmatchedReleasePlanAdmission.Name = "other-rpa"
+			unmatchedReleasePlanAdmission.ResourceVersion = ""
+			Expect(k8sClient.Create(ctx, unmatchedReleasePlanAdmission)).To(Succeed())
+
+			Eventually(func() bool {
+				returnedObject, err := loader.GetMatchingReleasePlans(ctx, k8sClient, unmatchedReleasePlanAdmission)
 				return returnedObject != &v1alpha1.ReleasePlanList{} && err == nil && len(returnedObject.Items) == 2
-			})
+			}).Should(BeTrue())
+
+			Expect(k8sClient.Delete(ctx, unmatchedReleasePlanAdmission)).To(Succeed())
 		})
 
 		It("does not return a ReleasePlan with a different application", func() {
@@ -250,7 +400,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 					}
 				}
 				return returnedObject != &v1alpha1.ReleasePlanList{} && err == nil && contains == false
-			})
+			}).Should(BeTrue())
 		})
 
 		It("fails to return release plans if origin is empty", func() {
@@ -261,6 +411,62 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("releasePlanAdmission has no origin, so no ReleasePlans can be found"))
 			Expect(returnedObject).To(BeNil())
+		})
+
+		It("returns ReleasePlans when RPA uses componentGroups and RP uses componentGroup", func() {
+			cgReleasePlan := &v1alpha1.ReleasePlan{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cg-rp-for-matching",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ReleasePlanSpec{
+					ComponentGroup: "test-component-group",
+					Target:         "default",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cgReleasePlan)).To(Succeed())
+
+			cgReleasePlanAdmission := &v1alpha1.ReleasePlanAdmission{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cg-rpa-for-matching",
+					Namespace: "default",
+					Labels: map[string]string{
+						metadata.BlockReleasesLabel: "false",
+					},
+				},
+				Spec: v1alpha1.ReleasePlanAdmissionSpec{
+					ComponentGroups: []string{"test-component-group"},
+					Origin:          "default",
+					Pipeline: &tektonutils.Pipeline{
+						PipelineRef: tektonutils.PipelineRef{
+							Resolver: "bundles",
+							Params: []tektonutils.Param{
+								{Name: "bundle", Value: "testbundle"},
+								{Name: "name", Value: "release-pipeline"},
+								{Name: "kind", Value: "pipeline"},
+							},
+						},
+					},
+					Policy: enterpriseContractPolicy.Name,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cgReleasePlanAdmission)).To(Succeed())
+
+			Eventually(func() bool {
+				returnedObject, err := loader.GetMatchingReleasePlans(ctx, k8sClient, cgReleasePlanAdmission)
+				if err != nil || returnedObject == nil {
+					return false
+				}
+				for _, rp := range returnedObject.Items {
+					if rp.Name == cgReleasePlan.Name {
+						return true
+					}
+				}
+				return false
+			}).Should(BeTrue())
+
+			Expect(k8sClient.Delete(ctx, cgReleasePlan)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cgReleasePlanAdmission)).To(Succeed())
 		})
 	})
 
@@ -295,6 +501,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			newerRelease = release.DeepCopy()
 			newerRelease.Name = "newer-release"
 			newerRelease.ResourceVersion = ""
+			newerRelease.Spec.Snapshot = "new-snapshot"
 			Expect(k8sClient.Create(ctx, newerRelease)).To(Succeed())
 
 			// Wait until the new release is cached
@@ -315,6 +522,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			newerRelease = release.DeepCopy()
 			newerRelease.Name = "newer-release"
 			newerRelease.ResourceVersion = ""
+			newerRelease.Spec.Snapshot = "new-snapshot"
 			Expect(k8sClient.Create(ctx, newerRelease)).To(Succeed())
 
 			// Wait until the new release is cached
@@ -327,6 +535,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			mostRecentRelease = release.DeepCopy()
 			mostRecentRelease.Name = "most-recent-release"
 			mostRecentRelease.ResourceVersion = ""
+			mostRecentRelease.Spec.Snapshot = "most-recent-snapshot"
 			Expect(k8sClient.Create(ctx, mostRecentRelease)).To(Succeed())
 
 			// Wait until the new release is cached
@@ -339,6 +548,82 @@ var _ = Describe("Release Adapter", Ordered, func() {
 			Expect(returnedObject).ToNot(BeNil())
 			Expect(returnedObject.Name).To(Equal(newerRelease.Name))
 		})
+
+		It("returns the previous release with a different snapshot than the current release", func() {
+			// We need two new releases with the same snapshot
+			time.Sleep(1 * time.Second)
+
+			newerRelease = release.DeepCopy()
+			newerRelease.Name = "newer-release"
+			newerRelease.ResourceVersion = ""
+			newerRelease.Spec.Snapshot = "new-snapshot"
+			Expect(k8sClient.Create(ctx, newerRelease)).To(Succeed())
+
+			// Wait until the new release is cached
+			Eventually(func() error {
+				return k8sClient.Get(ctx, client.ObjectKey{Name: newerRelease.Name, Namespace: newerRelease.Namespace}, newerRelease)
+			}).Should(Succeed())
+
+			time.Sleep(1 * time.Second)
+
+			mostRecentRelease = release.DeepCopy()
+			mostRecentRelease.Name = "newer-release-retry"
+			mostRecentRelease.ResourceVersion = ""
+			mostRecentRelease.Spec.Snapshot = "new-snapshot"
+			Expect(k8sClient.Create(ctx, mostRecentRelease)).To(Succeed())
+
+			// Wait until the new release is cached
+			Eventually(func() error {
+				return k8sClient.Get(ctx, client.ObjectKey{Name: mostRecentRelease.Name, Namespace: mostRecentRelease.Namespace}, mostRecentRelease)
+			}).Should(Succeed())
+
+			time.Sleep(1 * time.Second)
+
+			returnedObject, err := loader.GetPreviousRelease(ctx, k8sClient, mostRecentRelease)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(returnedObject).ToNot(BeNil())
+			Expect(returnedObject.Name).To(Equal(release.Name))
+			Expect(returnedObject.Spec.Snapshot).To(Not(Equal(mostRecentRelease.Spec.Snapshot)))
+		})
+
+		It("returns the previous release that was successful before the current release", func() {
+			// We need two new releases one that failed and one that was successful
+			time.Sleep(1 * time.Second)
+
+			newerRelease = release.DeepCopy()
+			newerRelease.Name = "newer-release"
+			newerRelease.ResourceVersion = ""
+			newerRelease.Spec.Snapshot = "new-snapshot"
+			Expect(k8sClient.Create(ctx, newerRelease)).To(Succeed())
+
+			// Wait until the new release is cached
+			Eventually(func() error {
+				return k8sClient.Get(ctx, client.ObjectKey{Name: newerRelease.Name, Namespace: newerRelease.Namespace}, newerRelease)
+			}).Should(Succeed())
+
+			// Mark as release failed
+			newerRelease.MarkReleasing("")
+			newerRelease.MarkReleaseFailed("")
+			Expect(k8sClient.Status().Update(ctx, newerRelease)).To(Succeed())
+
+			mostRecentRelease = release.DeepCopy()
+			mostRecentRelease.Name = "most-recent-release"
+			mostRecentRelease.ResourceVersion = ""
+			mostRecentRelease.Spec.Snapshot = "most-recent-snapshot"
+			Expect(k8sClient.Create(ctx, mostRecentRelease)).To(Succeed())
+
+			// Wait until the new release is cached
+			Eventually(func() error {
+				return k8sClient.Get(ctx, client.ObjectKey{Name: mostRecentRelease.Name, Namespace: mostRecentRelease.Namespace}, mostRecentRelease)
+			}).Should(Succeed())
+
+			time.Sleep(1 * time.Second)
+
+			returnedObject, err := loader.GetPreviousRelease(ctx, k8sClient, mostRecentRelease)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(returnedObject).ToNot(BeNil())
+			Expect(returnedObject.Name).To(Equal(release.Name))
+		})
 	})
 
 	When("calling GetRelease", func() {
@@ -350,28 +635,35 @@ var _ = Describe("Release Adapter", Ordered, func() {
 		})
 	})
 
-	When("calling GetRoleBindingFromReleaseStatus", func() {
-		It("fails to return a RoleBinding if the reference is not in the release", func() {
-			returnedObject, err := loader.GetRoleBindingFromReleaseStatus(ctx, k8sClient, release)
+	When("calling GetRoleBindingFromReleaseStatusPipelineInfo", func() {
+		It("fails to return a tenant RoleBinding if the reference is not in the release", func() {
+			returnedObject, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(ctx, k8sClient, &release.Status.ManagedProcessing, "tenant")
 			Expect(returnedObject).To(BeNil())
-			Expect(err.Error()).To(ContainSubstring("release doesn't contain a valid reference to a RoleBinding"))
+			Expect(stderrors.Is(err, ErrInvalidRoleBindingRef)).To(BeTrue())
 		})
 
-		It("fails to return a RoleBinding if the roleBinding does not exist", func() {
+		It("fails to return a tenant RoleBinding if the roleBinding does not exist", func() {
 			modifiedRelease := release.DeepCopy()
-			modifiedRelease.Status.ManagedProcessing.RoleBinding = "foo/bar"
+			modifiedRelease.Status.ManagedProcessing.RoleBindings.TenantRoleBinding = "foo/bar"
 
-			returnedObject, err := loader.GetRoleBindingFromReleaseStatus(ctx, k8sClient, modifiedRelease)
+			returnedObject, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(ctx, k8sClient, &modifiedRelease.Status.ManagedProcessing, "tenant")
 			Expect(returnedObject).To(BeNil())
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("fails to return a RoleBinding for an invalid type", func() {
+			modifiedRelease := release.DeepCopy()
+			returnedObject, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(ctx, k8sClient, &modifiedRelease.Status.ManagedProcessing, "foo")
+			Expect(returnedObject).To(BeNil())
+			Expect(err.Error()).To(ContainSubstring("invalid role binding type"))
+		})
+
 		It("returns the requested resource", func() {
 			modifiedRelease := release.DeepCopy()
-			modifiedRelease.Status.ManagedProcessing.RoleBinding = fmt.Sprintf("%s%c%s", roleBinding.Namespace,
+			modifiedRelease.Status.ManagedProcessing.RoleBindings.TenantRoleBinding = fmt.Sprintf("%s%c%s", roleBinding.Namespace,
 				types.Separator, roleBinding.Name)
 
-			returnedObject, err := loader.GetRoleBindingFromReleaseStatus(ctx, k8sClient, modifiedRelease)
+			returnedObject, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(ctx, k8sClient, &modifiedRelease.Status.ManagedProcessing, "tenant")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(returnedObject).NotTo(Equal(&rbac.RoleBinding{}))
 			Expect(returnedObject.Name).To(Equal(roleBinding.Name))
@@ -380,7 +672,8 @@ var _ = Describe("Release Adapter", Ordered, func() {
 
 	When("calling GetReleasePipelineRun", func() {
 		It("returns an error when called with an unexpected Pipeline type", func() {
-			returnedObject, err := loader.GetReleasePipelineRun(ctx, k8sClient, release, "foo")
+			invalidPipelineType := metadata.PipelineType("invalid-type")
+			returnedObject, err := loader.GetReleasePipelineRun(ctx, k8sClient, release, invalidPipelineType)
 			Expect(returnedObject).To(BeNil())
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("invalid type"))
@@ -553,7 +846,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Name:      "release-plan-admission",
 				Namespace: "default",
 				Labels: map[string]string{
-					metadata.AutoReleaseLabel: "true",
+					metadata.BlockReleasesLabel: "false",
 				},
 			},
 			Spec: v1alpha1.ReleasePlanAdmissionSpec{
@@ -615,7 +908,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Labels: map[string]string{
 					metadata.ReleaseNameLabel:      release.Name,
 					metadata.ReleaseNamespaceLabel: release.Namespace,
-					metadata.PipelinesTypeLabel:    metadata.FinalPipelineType,
+					metadata.PipelinesTypeLabel:    metadata.FinalPipelineType.String(),
 				},
 				Name:      "final-pipeline-run",
 				Namespace: "default",
@@ -628,7 +921,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Labels: map[string]string{
 					metadata.ReleaseNameLabel:      release.Name,
 					metadata.ReleaseNamespaceLabel: release.Namespace,
-					metadata.PipelinesTypeLabel:    metadata.ManagedCollectorsPipelineType,
+					metadata.PipelinesTypeLabel:    metadata.ManagedCollectorsPipelineType.String(),
 				},
 				Name:      "managed-collectors-pipeline-run",
 				Namespace: "default",
@@ -641,7 +934,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Labels: map[string]string{
 					metadata.ReleaseNameLabel:      release.Name,
 					metadata.ReleaseNamespaceLabel: release.Namespace,
-					metadata.PipelinesTypeLabel:    metadata.ManagedPipelineType,
+					metadata.PipelinesTypeLabel:    metadata.ManagedPipelineType.String(),
 				},
 				Name:      "managed-pipeline-run",
 				Namespace: "default",
@@ -654,7 +947,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Labels: map[string]string{
 					metadata.ReleaseNameLabel:      release.Name,
 					metadata.ReleaseNamespaceLabel: release.Namespace,
-					metadata.PipelinesTypeLabel:    metadata.TenantCollectorsPipelineType,
+					metadata.PipelinesTypeLabel:    metadata.TenantCollectorsPipelineType.String(),
 				},
 				Name:      "tenant-collectors-pipeline-run",
 				Namespace: "default",
@@ -667,7 +960,7 @@ var _ = Describe("Release Adapter", Ordered, func() {
 				Labels: map[string]string{
 					metadata.ReleaseNameLabel:      release.Name,
 					metadata.ReleaseNamespaceLabel: release.Namespace,
-					metadata.PipelinesTypeLabel:    metadata.TenantPipelineType,
+					metadata.PipelinesTypeLabel:    metadata.TenantPipelineType.String(),
 				},
 				Name:      "tenant-pipeline-run",
 				Namespace: "default",

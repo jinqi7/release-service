@@ -2,27 +2,29 @@ package loader
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-
-	"k8s.io/utils/strings/slices"
-
+	ecapiv1alpha1 "github.com/conforma/crds/api/v1alpha1"
+	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
 	toolkit "github.com/konflux-ci/operator-toolkit/loader"
-
-	ecapiv1alpha1 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
-	"github.com/konflux-ci/release-service/api/v1alpha1"
-	"github.com/konflux-ci/release-service/metadata"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/konflux-ci/release-service/api/v1alpha1"
+	"github.com/konflux-ci/release-service/metadata"
 )
+
+// ErrInvalidRoleBindingRef is returned when PipelineInfo.RoleBindings does no parse as “namespace/name”.
+var ErrInvalidRoleBindingRef = fmt.Errorf("pipelineInfo doesn't contain a valid reference to a RoleBinding")
 
 type ObjectLoader interface {
 	GetActiveReleasePlanAdmission(ctx context.Context, cli client.Client, releasePlan *v1alpha1.ReleasePlan) (*v1alpha1.ReleasePlanAdmission, error)
@@ -34,8 +36,8 @@ type ObjectLoader interface {
 	GetMatchingReleasePlans(ctx context.Context, cli client.Client, releasePlanAdmission *v1alpha1.ReleasePlanAdmission) (*v1alpha1.ReleasePlanList, error)
 	GetPreviousRelease(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*v1alpha1.Release, error)
 	GetRelease(ctx context.Context, cli client.Client, name, namespace string) (*v1alpha1.Release, error)
-	GetRoleBindingFromReleaseStatus(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*rbac.RoleBinding, error)
-	GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType string) (*tektonv1.PipelineRun, error)
+	GetRoleBindingFromReleaseStatusPipelineInfo(ctx context.Context, cli client.Client, pipelineInfo *v1alpha1.PipelineInfo, roleBindingType string) (*rbac.RoleBinding, error)
+	GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType metadata.PipelineType) (*tektonv1.PipelineRun, error)
 	GetReleasePlan(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*v1alpha1.ReleasePlan, error)
 	GetReleaseServiceConfig(ctx context.Context, cli client.Client, name, namespace string) (*v1alpha1.ReleaseServiceConfig, error)
 	GetSnapshot(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*applicationapiv1alpha1.Snapshot, error)
@@ -49,18 +51,18 @@ func NewLoader() ObjectLoader {
 }
 
 // GetActiveReleasePlanAdmission returns the ReleasePlanAdmission targeted by the given ReleasePlan.
-// Only ReleasePlanAdmissions with the 'auto-release' label set to true (or missing the label, which is
-// treated the same as having the label and it being set to true) will be searched for. If a matching
-// ReleasePlanAdmission is not found or the List operation fails, an error will be returned.
+// Only ReleasePlanAdmissions with the 'block-releases' label set to false will be searched for.
+// If a matching ReleasePlanAdmission is not found or the List operation fails, an error will be
+// returned.
 func (l *loader) GetActiveReleasePlanAdmission(ctx context.Context, cli client.Client, releasePlan *v1alpha1.ReleasePlan) (*v1alpha1.ReleasePlanAdmission, error) {
 	releasePlanAdmission, err := l.GetMatchingReleasePlanAdmission(ctx, cli, releasePlan)
 	if err != nil {
 		return nil, err
 	}
 
-	labelValue, found := releasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]
-	if found && labelValue == "false" {
-		return nil, fmt.Errorf("found ReleasePlanAdmission '%s' with auto-release label set to false",
+	labelValue, found := releasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel]
+	if found && labelValue == "true" {
+		return nil, fmt.Errorf("found ReleasePlanAdmission '%s' with block-releases label set to true",
 			releasePlanAdmission.Name)
 	}
 
@@ -106,7 +108,6 @@ func (l *loader) GetEnterpriseContractConfigMap(ctx context.Context, cli client.
 	}
 
 	return nil, nil
-
 }
 
 // GetMatchingReleasePlanAdmission returns the ReleasePlanAdmission targeted by the given ReleasePlan.
@@ -120,6 +121,11 @@ func (l *loader) GetMatchingReleasePlanAdmission(ctx context.Context, cli client
 		err := toolkit.GetObject(designatedReleasePlanAdmissionName, releasePlan.Spec.Target, cli, ctx, releasePlanAdmission)
 		if err != nil {
 			return nil, err
+		}
+		if releasePlanAdmission.Spec.Origin != releasePlan.Namespace {
+			return nil, fmt.Errorf("releasePlan (%+s) targets releasePlanAdmission (%+s) by label, but the Origin"+
+				" of the releasePlanAdmission (%+s) does not match the namespace of the releasePlan (%+s)",
+				releasePlan.Name, designatedReleasePlanAdmissionName, releasePlanAdmission.Spec.Origin, releasePlan.Namespace)
 		}
 		return releasePlanAdmission, nil
 	}
@@ -139,21 +145,21 @@ func (l *loader) GetMatchingReleasePlanAdmission(ctx context.Context, cli client
 	var foundReleasePlanAdmission *v1alpha1.ReleasePlanAdmission
 
 	for i, releasePlanAdmission := range releasePlanAdmissions.Items {
-		if !slices.Contains(releasePlanAdmission.Spec.Applications, releasePlan.Spec.Application) {
+		if !releasePlanAdmission.MatchesReleasePlan(releasePlan) {
 			continue
 		}
 
 		if foundReleasePlanAdmission != nil {
-			return nil, fmt.Errorf("multiple ReleasePlanAdmissions found in namespace (%+s) with the origin (%+s) for application '%s'",
-				releasePlan.Spec.Target, releasePlan.Namespace, releasePlan.Spec.Application)
+			return nil, fmt.Errorf("multiple ReleasePlanAdmissions found in namespace (%+s) with the origin (%+s) for '%s'",
+				releasePlan.Spec.Target, releasePlan.Namespace, releasePlan.GetGroupName())
 		}
 
 		foundReleasePlanAdmission = &releasePlanAdmissions.Items[i]
 	}
 
 	if foundReleasePlanAdmission == nil {
-		return nil, fmt.Errorf("no ReleasePlanAdmission found in namespace (%+s) with the origin (%+s) for application '%s'",
-			releasePlan.Spec.Target, releasePlan.Namespace, releasePlan.Spec.Application)
+		return nil, fmt.Errorf("no ReleasePlanAdmission found in namespace (%+s) with the origin (%+s) for '%s'",
+			releasePlan.Spec.Target, releasePlan.Namespace, releasePlan.GetGroupName())
 	}
 
 	return foundReleasePlanAdmission, nil
@@ -161,10 +167,9 @@ func (l *loader) GetMatchingReleasePlanAdmission(ctx context.Context, cli client
 
 // GetMatchingReleasePlans returns a list of all ReleasePlans that target the given ReleasePlanAdmission's
 // namespace, specify an application that is included in the ReleasePlanAdmission's application list, and
-// are in the namespace specified by the ReleasePlanAdmission's origin. If the List operation fails, an
-// error will be returned.
+// are in the namespace specified by the ReleasePlanAdmission's origin. optionally filter by the ReleasePlanAdmission
+// label (falling back to all). If the List operation fails, an error will be returned.
 func (l *loader) GetMatchingReleasePlans(ctx context.Context, cli client.Client, releasePlanAdmission *v1alpha1.ReleasePlanAdmission) (*v1alpha1.ReleasePlanList, error) {
-
 	if releasePlanAdmission.Spec.Origin == "" {
 		return nil, fmt.Errorf("releasePlanAdmission has no origin, so no ReleasePlans can be found")
 	}
@@ -172,14 +177,32 @@ func (l *loader) GetMatchingReleasePlans(ctx context.Context, cli client.Client,
 	releasePlans := &v1alpha1.ReleasePlanList{}
 	err := cli.List(ctx, releasePlans,
 		client.InNamespace(releasePlanAdmission.Spec.Origin),
-		client.MatchingFields{"spec.target": releasePlanAdmission.Namespace})
+		client.MatchingFields{"spec.target": releasePlanAdmission.Namespace},
+		client.MatchingLabels{metadata.ReleasePlanAdmissionLabel: releasePlanAdmission.Name})
 	if err != nil {
 		return nil, err
 	}
 
+	// If no ReleasePlans have matching labels, fall back to all ReleasePlans
+	if len(releasePlans.Items) == 0 {
+		err := cli.List(ctx, releasePlans,
+			client.InNamespace(releasePlanAdmission.Spec.Origin),
+			client.MatchingFields{"spec.target": releasePlanAdmission.Namespace})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	for i := len(releasePlans.Items) - 1; i >= 0; i-- {
-		if !slices.Contains(releasePlanAdmission.Spec.Applications, releasePlans.Items[i].Spec.Application) {
-			// Remove ReleasePlans that do not have matching applications from the list
+		if !releasePlanAdmission.MatchesReleasePlan(&releasePlans.Items[i]) {
+			// Remove ReleasePlans that do not have matching applications or componentGroups from the list
+			releasePlans.Items = append(releasePlans.Items[:i], releasePlans.Items[i+1:]...)
+			continue
+		}
+
+		labelValue, found := releasePlans.Items[i].GetLabels()[metadata.ReleasePlanAdmissionLabel]
+		if found && labelValue != releasePlanAdmission.Name {
+			// Remove ReleasePlans whose label doesn't match the ReleasePlanAdmission name
 			releasePlans.Items = append(releasePlans.Items[:i], releasePlans.Items[i+1:]...)
 		}
 	}
@@ -207,13 +230,21 @@ func (l *loader) GetPreviousRelease(ctx context.Context, cli client.Client, rele
 			possiblePreviousRelease.CreationTimestamp.After(release.CreationTimestamp.Time) {
 			continue
 		}
+		// Ignore a release that failed previously
+		if possiblePreviousRelease.IsFailed() {
+			continue
+		}
+		// Ignore a release that has the same snapshot as the current release
+		if possiblePreviousRelease.Spec.Snapshot == release.Spec.Snapshot {
+			continue
+		}
 		if previousRelease == nil || possiblePreviousRelease.CreationTimestamp.After(previousRelease.CreationTimestamp.Time) {
 			previousRelease = &releases.Items[i]
 		}
 	}
 
 	if previousRelease == nil {
-		return nil, errors.NewNotFound(
+		return nil, apierrors.NewNotFound(
 			schema.GroupResource{
 				Group:    v1alpha1.GroupVersion.Group,
 				Resource: release.GetObjectKind().GroupVersionKind().Kind,
@@ -230,16 +261,27 @@ func (l *loader) GetRelease(ctx context.Context, cli client.Client, name, namesp
 	return release, toolkit.GetObject(name, namespace, cli, ctx, release)
 }
 
-// GetRoleBindingFromReleaseStatus returns the RoleBinding associated with the given Release. That association is defined
-// by the namespaced name stored in the Release's status.
-func (l *loader) GetRoleBindingFromReleaseStatus(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*rbac.RoleBinding, error) {
+// GetRoleBindingFromReleaseStatusPipelineInfo retrieves the RoleBinding associated with a PipelineInfo and role binding type..
+// The association is defined by the namespaced name stored in the RoleBindings field of the provided PipelineInfo.
+func (l *loader) GetRoleBindingFromReleaseStatusPipelineInfo(ctx context.Context, cli client.Client, pipelineInfo *v1alpha1.PipelineInfo, roleBindingType string) (*rbac.RoleBinding, error) {
 	roleBinding := &rbac.RoleBinding{}
-	roleBindingNamespacedName := strings.Split(release.Status.ManagedProcessing.RoleBinding, string(types.Separator))
-	if len(roleBindingNamespacedName) != 2 {
-		return nil, fmt.Errorf("release doesn't contain a valid reference to a RoleBinding ('%s')",
-			release.Status.ManagedProcessing.RoleBinding)
+
+	var namespacedName string
+	switch roleBindingType {
+	case "tenant":
+		namespacedName = pipelineInfo.RoleBindings.TenantRoleBinding
+	case "managed":
+		namespacedName = pipelineInfo.RoleBindings.ManagedRoleBinding
+	case "secret":
+		namespacedName = pipelineInfo.RoleBindings.SecretRoleBinding
+	default:
+		return nil, fmt.Errorf("invalid role binding type ('%s')", roleBindingType)
 	}
 
+	roleBindingNamespacedName := strings.Split(namespacedName, string(types.Separator))
+	if len(roleBindingNamespacedName) != 2 {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidRoleBindingRef, namespacedName)
+	}
 	err := cli.Get(ctx, types.NamespacedName{
 		Namespace: roleBindingNamespacedName[0],
 		Name:      roleBindingNamespacedName[1],
@@ -253,7 +295,7 @@ func (l *loader) GetRoleBindingFromReleaseStatus(ctx context.Context, cli client
 
 // GetReleasePipelineRun returns the Release PipelineRun of the specified type referenced by the given Release
 // or nil if it's not found. In the case the List operation fails, an error will be returned.
-func (l *loader) GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType string) (*tektonv1.PipelineRun, error) {
+func (l *loader) GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType metadata.PipelineType) (*tektonv1.PipelineRun, error) {
 	if pipelineType != metadata.ManagedCollectorsPipelineType && pipelineType != metadata.ManagedPipelineType &&
 		pipelineType != metadata.TenantCollectorsPipelineType && pipelineType != metadata.TenantPipelineType && pipelineType != metadata.FinalPipelineType {
 		return nil, fmt.Errorf("cannot fetch Release PipelineRun with invalid type %s", pipelineType)
@@ -265,7 +307,7 @@ func (l *loader) GetReleasePipelineRun(ctx context.Context, cli client.Client, r
 		client.MatchingLabels{
 			metadata.ReleaseNameLabel:      release.Name,
 			metadata.ReleaseNamespaceLabel: release.Namespace,
-			metadata.PipelinesTypeLabel:    pipelineType,
+			metadata.PipelinesTypeLabel:    pipelineType.String(),
 		})
 	if err == nil && len(pipelineRuns.Items) > 0 {
 		return &pipelineRuns.Items[0], nil
@@ -336,4 +378,29 @@ func (l *loader) GetProcessingResources(ctx context.Context, cli client.Client, 
 	}
 
 	return resources, nil
+}
+
+// IsRetriable returns true if the error is transient, such as a
+// network hiccup, concurrency conflict, or server-side throttling,
+// indicating that the operation should be retried.
+func IsRetriable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if apierrors.IsConflict(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsInternalError(err) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+
+	return false
 }

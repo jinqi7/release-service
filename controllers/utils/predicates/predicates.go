@@ -44,7 +44,7 @@ func MatchPredicate() predicate.Predicate {
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			return haveApplicationsChanged(e.ObjectOld, e.ObjectNew) ||
-				hasAutoReleaseLabelChanged(e.ObjectOld, e.ObjectNew) ||
+				hasBehaviorLabelChanged(e.ObjectOld, e.ObjectNew) ||
 				hasMatchConditionChanged(e.ObjectOld, e.ObjectNew) ||
 				hasSourceChanged(e.ObjectOld, e.ObjectNew)
 		},
@@ -61,27 +61,32 @@ func hasConditionChanged(conditionOld, conditionNew *metav1.Condition) bool {
 	return !conditionOld.LastTransitionTime.Equal(&conditionNew.LastTransitionTime)
 }
 
-// hasAutoReleaseLabelChanged returns true if the auto-release label value is
+// hasBehaviorLabelChanged returns true if the auto-release or block-releases label value is
 // different between the two objects.
-func hasAutoReleaseLabelChanged(objectOld, objectNew client.Object) bool {
-	return objectOld.GetLabels()[metadata.AutoReleaseLabel] != objectNew.GetLabels()[metadata.AutoReleaseLabel]
+func hasBehaviorLabelChanged(objectOld, objectNew client.Object) bool {
+	if objectOld.GetLabels()[metadata.AutoReleaseLabel] != objectNew.GetLabels()[metadata.AutoReleaseLabel] {
+		return true
+	}
+	if objectOld.GetLabels()[metadata.BlockReleasesLabel] != objectNew.GetLabels()[metadata.BlockReleasesLabel] {
+		return true
+	}
+	return false
 }
 
 // haveApplicationsChanged returns true if passed objects are of the same kind and the
-// Spec.Application(s) values between them is different.
+// Spec.Application/ComponentGroup or Spec.Applications/ComponentGroups values between them is different.
 func haveApplicationsChanged(objectOld, objectNew client.Object) bool {
 	if releasePlanOld, ok := objectOld.(*v1alpha1.ReleasePlan); ok {
 		if releasePlanNew, ok := objectNew.(*v1alpha1.ReleasePlan); ok {
-			return releasePlanOld.Spec.Application != releasePlanNew.Spec.Application
+			return releasePlanOld.Spec.Application != releasePlanNew.Spec.Application ||
+				releasePlanOld.Spec.ComponentGroup != releasePlanNew.Spec.ComponentGroup
 		}
 	}
 
 	if releasePlanAdmissionOld, ok := objectOld.(*v1alpha1.ReleasePlanAdmission); ok {
 		if releasePlanAdmissionNew, ok := objectNew.(*v1alpha1.ReleasePlanAdmission); ok {
-			return !reflect.DeepEqual(
-				releasePlanAdmissionOld.Spec.Applications,
-				releasePlanAdmissionNew.Spec.Applications,
-			)
+			return !reflect.DeepEqual(releasePlanAdmissionOld.Spec.Applications, releasePlanAdmissionNew.Spec.Applications) ||
+				!reflect.DeepEqual(releasePlanAdmissionOld.Spec.ComponentGroups, releasePlanAdmissionNew.Spec.ComponentGroups)
 		}
 	}
 

@@ -17,6 +17,8 @@ limitations under the License.
 package tekton
 
 import (
+	"reflect"
+
 	"github.com/konflux-ci/release-service/metadata"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"knative.dev/pkg/apis"
@@ -32,11 +34,11 @@ func isReleasePipelineRun(object client.Object) bool {
 
 	labelValue, found := object.GetLabels()[metadata.PipelinesTypeLabel]
 
-	return found && (labelValue == metadata.TenantCollectorsPipelineType ||
-		labelValue == metadata.ManagedCollectorsPipelineType ||
-		labelValue == metadata.FinalPipelineType ||
-		labelValue == metadata.ManagedPipelineType ||
-		labelValue == metadata.TenantPipelineType)
+	return found && (labelValue == metadata.TenantCollectorsPipelineType.String() ||
+		labelValue == metadata.ManagedCollectorsPipelineType.String() ||
+		labelValue == metadata.FinalPipelineType.String() ||
+		labelValue == metadata.ManagedPipelineType.String() ||
+		labelValue == metadata.TenantPipelineType.String())
 }
 
 // hasPipelineSucceeded returns a boolean indicating whether the PipelineRun succeeded or not.
@@ -47,4 +49,38 @@ func hasPipelineSucceeded(object client.Object) bool {
 	}
 
 	return false
+}
+
+// hasFinalizersChanged returns true if the finalizers have changed between old and new objects.
+// This helps detect when other controllers (like Tekton) are modifying finalizers during deletion.
+func hasFinalizersChanged(oldObj, newObj client.Object) bool {
+	if oldObj == nil || newObj == nil {
+		return false
+	}
+
+	oldFinalizers := oldObj.GetFinalizers()
+	newFinalizers := newObj.GetFinalizers()
+
+	return !reflect.DeepEqual(oldFinalizers, newFinalizers)
+}
+
+// hasDeletionTimestampChanged returns true if the deletion timestamp has changed between old and new objects.
+// This detects when a PipelineRun is marked for deletion.
+func hasDeletionTimestampChanged(oldObj, newObj client.Object) bool {
+	if oldObj == nil || newObj == nil {
+		return false
+	}
+	oldTs := oldObj.GetDeletionTimestamp()
+	newTs := newObj.GetDeletionTimestamp()
+	return (oldTs == nil) != (newTs == nil)
+}
+
+// IsPipelineRunDone returns true if the PipelineRun has completed (succeeded or failed)
+// or if it has been marked for deletion. This handles the edge case where a PipelineRun
+// is deleted while still running and Tekton hasn't updated the status to finished.
+func IsPipelineRunDone(pipelineRun *tektonv1.PipelineRun) bool {
+	if pipelineRun == nil {
+		return false
+	}
+	return pipelineRun.IsDone() || pipelineRun.GetDeletionTimestamp() != nil
 }

@@ -5,9 +5,10 @@ import (
 
 	toolkit "github.com/konflux-ci/operator-toolkit/loader"
 
-	ecapiv1alpha1 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
+	ecapiv1alpha1 "github.com/conforma/crds/api/v1alpha1"
+	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
+	"github.com/konflux-ci/release-service/metadata"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
@@ -114,16 +115,16 @@ func (l *mockLoader) GetRelease(ctx context.Context, cli client.Client, name, na
 	return toolkit.GetMockedResourceAndErrorFromContext(ctx, ReleaseContextKey, &v1alpha1.Release{})
 }
 
-// GetRoleBindingFromReleaseStatus returns the resource and error passed as values of the context.
-func (l *mockLoader) GetRoleBindingFromReleaseStatus(ctx context.Context, cli client.Client, release *v1alpha1.Release) (*rbac.RoleBinding, error) {
+// GetRoleBindingFromReleaseStatusPipelineInfo returns the resource and error passed as values of the context.
+func (l *mockLoader) GetRoleBindingFromReleaseStatusPipelineInfo(ctx context.Context, cli client.Client, pipelineInfo *v1alpha1.PipelineInfo, roleBindingType string) (*rbac.RoleBinding, error) {
 	if ctx.Value(RoleBindingContextKey) == nil {
-		return l.loader.GetRoleBindingFromReleaseStatus(ctx, cli, release)
+		return l.loader.GetRoleBindingFromReleaseStatusPipelineInfo(ctx, cli, pipelineInfo, roleBindingType)
 	}
 	return toolkit.GetMockedResourceAndErrorFromContext(ctx, RoleBindingContextKey, &rbac.RoleBinding{})
 }
 
 // GetReleasePipelineRun returns the resource and error passed as values of the context.
-func (l *mockLoader) GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType string) (*tektonv1.PipelineRun, error) {
+func (l *mockLoader) GetReleasePipelineRun(ctx context.Context, cli client.Client, release *v1alpha1.Release, pipelineType metadata.PipelineType) (*tektonv1.PipelineRun, error) {
 	if ctx.Value(ReleasePipelineRunContextKey) == nil {
 		return l.loader.GetReleasePipelineRun(ctx, cli, release, pipelineType)
 	}

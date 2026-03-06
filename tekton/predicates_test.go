@@ -22,12 +22,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 var _ = Describe("Predicates", Ordered, func() {
-	When("testing ReleasePipelineRunSucceededPredicate predicate", func() {
+	When("testing ReleasePipelineRunLifecyclePredicate predicate", func() {
 		var err error
 		var pipelineRun *v1.PipelineRun
 
@@ -40,27 +41,52 @@ var _ = Describe("Predicates", Ordered, func() {
 			contextEvent := event.CreateEvent{
 				Object: pipelineRun,
 			}
-			Expect(ReleasePipelineRunSucceededPredicate().Create(contextEvent)).To(BeFalse())
+			Expect(ReleasePipelineRunLifecyclePredicate().Create(contextEvent)).To(BeFalse())
 		})
 
-		It("should ignore deleting events", func() {
+		It("should ignore deleting events for non-release PipelineRuns", func() {
 			contextEvent := event.DeleteEvent{
 				Object: pipelineRun,
 			}
-			Expect(ReleasePipelineRunSucceededPredicate().Delete(contextEvent)).To(BeFalse())
+			Expect(ReleasePipelineRunLifecyclePredicate().Delete(contextEvent)).To(BeFalse())
+		})
+
+		It("should ignore deleting events for release PipelineRuns without our finalizer", func() {
+			releasePipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			contextEvent := event.DeleteEvent{
+				Object: releasePipelineRun,
+			}
+			Expect(ReleasePipelineRunLifecyclePredicate().Delete(contextEvent)).To(BeFalse())
+		})
+
+		It("should reconcile deleting events for release PipelineRuns with our finalizer", func() {
+			releasePipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			contextEvent := event.DeleteEvent{
+				Object: releasePipelineRun,
+			}
+			Expect(ReleasePipelineRunLifecyclePredicate().Delete(contextEvent)).To(BeTrue())
 		})
 
 		It("should ignore generic events", func() {
 			contextEvent := event.GenericEvent{
 				Object: pipelineRun,
 			}
-			Expect(ReleasePipelineRunSucceededPredicate().Generic(contextEvent)).To(BeFalse())
+			Expect(ReleasePipelineRunLifecyclePredicate().Generic(contextEvent)).To(BeFalse())
 		})
 
 		It("should return true when an updated event is received for a succeeded managed PipelineRun", func() {
 			var releasePipelineRun *v1.PipelineRun
 			releasePipelineRun, err = utils.NewPipelineRunBuilder("pipeline-run", "default").
-				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType}).
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
 				Build()
 			Expect(err).NotTo(HaveOccurred())
 			contextEvent := event.UpdateEvent{
@@ -68,10 +94,137 @@ var _ = Describe("Predicates", Ordered, func() {
 				ObjectNew: releasePipelineRun,
 			}
 			releasePipelineRun.Status.MarkRunning("Predicate function tests", "Set it to Unknown")
-			Expect(ReleasePipelineRunSucceededPredicate().Update(contextEvent)).To(BeFalse())
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeFalse())
 
 			releasePipelineRun.Status.MarkSucceeded("Predicate function tests", "Set it to Succeeded")
-			Expect(ReleasePipelineRunSucceededPredicate().Update(contextEvent)).To(BeTrue())
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeTrue())
+		})
+
+		It("should trigger when finalizers change on a release PipelineRun", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeTrue())
+		})
+
+		It("should trigger when finalizers are removed from a release PipelineRun", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				WithFinalizer("tekton.dev/finalizer").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer("tekton.dev/finalizer").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeTrue())
+		})
+
+		It("should not trigger when finalizers are unchanged", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun.Status.MarkRunning("Test", "Running")
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeFalse())
+		})
+
+		It("should not trigger when finalizers change on non-release PipelineRuns", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithFinalizer("some.other/finalizer").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeFalse())
+		})
+
+		It("should trigger when deletionTimestamp is set on a release PipelineRun", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+			oldPipelineRun.Status.MarkRunning("Test", "Running")
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				WithLabels(map[string]string{metadata.PipelinesTypeLabel: metadata.ManagedPipelineType.String()}).
+				WithFinalizer(metadata.ReleaseFinalizer).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+			newPipelineRun.Status.MarkRunning("Test", "Running")
+			now := metav1.Now()
+			newPipelineRun.DeletionTimestamp = &now
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeTrue())
+		})
+
+		It("should not trigger when deletionTimestamp is set on non-release PipelineRuns", func() {
+			oldPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			newPipelineRun, err := utils.NewPipelineRunBuilder("pipeline-run", "default").
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+			now := metav1.Now()
+			newPipelineRun.DeletionTimestamp = &now
+
+			contextEvent := event.UpdateEvent{
+				ObjectOld: oldPipelineRun,
+				ObjectNew: newPipelineRun,
+			}
+
+			Expect(ReleasePipelineRunLifecyclePredicate().Update(contextEvent)).To(BeFalse())
 		})
 	})
 })

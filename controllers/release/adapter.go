@@ -18,26 +18,33 @@ package release
 
 import (
 	"context"
+	"encoding/json"
+	stderrors "errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
+	integrationgitops "github.com/konflux-ci/integration-service/gitops"
 	"github.com/konflux-ci/operator-toolkit/controller"
 	toolkitmetadata "github.com/konflux-ci/operator-toolkit/metadata"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"github.com/konflux-ci/release-service/loader"
 	"github.com/konflux-ci/release-service/metadata"
 	"github.com/konflux-ci/release-service/syncer"
+	"github.com/konflux-ci/release-service/tekton"
 	"github.com/konflux-ci/release-service/tekton/utils"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
-	integrationgitops "github.com/redhat-appstudio/integration-service/gitops"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -160,7 +167,7 @@ func (a *adapter) EnsureReleaseIsCompleted() (controller.OperationResult, error)
 	}
 
 	// The final pipeline processing has to complete for a Release to be completed
-	if !a.release.IsFinalPipelineProcessed() {
+	if !a.release.IsFinalPipelineProcessedSuccessfully() {
 		return controller.ContinueProcessing()
 	}
 
@@ -173,6 +180,11 @@ func (a *adapter) EnsureReleaseIsCompleted() (controller.OperationResult, error)
 // it is marked as releasing. If the Release has finished, no other operation after this one will be executed.
 func (a *adapter) EnsureReleaseIsRunning() (controller.OperationResult, error) {
 	if a.release.HasReleaseFinished() {
+		if !a.release.AreAllProcessingPhasesFinished() {
+			a.logger.Info("EnsureReleaseIsRunning: release finished but not all phases finished, continuing so we can complete properly",
+				"Release", fmt.Sprintf("%s/%s", a.release.Namespace, a.release.Name))
+			return controller.ContinueProcessing()
+		}
 		return controller.StopProcessing()
 	}
 
@@ -188,13 +200,34 @@ func (a *adapter) EnsureReleaseIsRunning() (controller.OperationResult, error) {
 // EnsureManagedCollectorsPipelineIsProcessed is an operation that will ensure that a Managed Collectors Release
 // PipelineRun associated to the Release being processed exists. Otherwise, it will be created.
 func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.OperationResult, error) {
-	if a.release.HasManagedCollectorsPipelineProcessingFinished() || !a.release.HasTenantCollectorsPipelineProcessingFinished() ||
-		!a.release.IsTenantCollectorsPipelineProcessed() {
+	if a.release.HasManagedCollectorsPipelineProcessingFinished() || !a.release.HasTenantCollectorsPipelineProcessingFinished() {
 		return controller.ContinueProcessing()
+	}
+
+	if a.release.IsFailed() {
+		// release failed, so we skip the managed collectors pipeline processing
+		patch := client.MergeFrom(a.release.DeepCopy())
+		a.release.MarkManagedCollectorsPipelineProcessingSkipped()
+		return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
 	}
 
 	pipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, metadata.ManagedCollectorsPipelineType)
 	if err != nil && !errors.IsNotFound(err) {
+		return controller.RequeueWithError(err)
+	}
+
+	tenantRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return controller.RequeueWithError(err)
+	}
+
+	managedRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "managed")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return controller.RequeueWithError(err)
+	}
+
+	secretRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
 		return controller.RequeueWithError(err)
 	}
 
@@ -219,6 +252,29 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 		}
 
 		if pipelineRun == nil {
+			if releasePlanAdmission.Spec.Collectors.ServiceAccountName != "" {
+				if tenantRoleBinding == nil {
+					tenantRoleBinding, err = a.createRoleBindingForClusterRole("release-pipeline-resource-role", releasePlanAdmission.Spec.Origin, releasePlanAdmission.Spec.Collectors.ServiceAccountName, releasePlanAdmission.Namespace)
+					if err != nil {
+						return controller.RequeueWithError(err)
+					}
+				}
+
+				if managedRoleBinding == nil {
+					managedRoleBinding, err = a.createRoleBindingForClusterRole("release-pipeline-resource-role", releasePlanAdmission.Namespace, releasePlanAdmission.Spec.Collectors.ServiceAccountName, releasePlanAdmission.Namespace)
+					if err != nil {
+						return controller.RequeueWithError(err)
+					}
+				}
+
+				if secretRoleBinding == nil && releasePlanAdmission.Spec.Collectors.Secrets != nil {
+					secretRoleBinding, err = a.createRoleBindingForCollectorSecrets("managed-collectors", releasePlanAdmission.Namespace, releasePlanAdmission.Spec.Collectors.ServiceAccountName, releasePlanAdmission.Spec.Collectors.Secrets)
+					if err != nil {
+						return controller.RequeueWithError(err)
+					}
+				}
+			}
+
 			pipelineRun, err = a.createManagedCollectorsPipelineRun(releasePlanAdmission)
 			if err != nil {
 				return controller.RequeueWithError(err)
@@ -228,7 +284,7 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 				"PipelineRun.Name", pipelineRun.Name, "PipelineRun.Namespace", pipelineRun.Namespace)
 		}
 
-		return controller.RequeueOnErrorOrContinue(a.registerManagedCollectorsProcessingData(pipelineRun))
+		return controller.RequeueOnErrorOrContinue(a.registerManagedCollectorsProcessingData(pipelineRun, tenantRoleBinding, managedRoleBinding, secretRoleBinding))
 	}
 
 	return controller.ContinueProcessing()
@@ -267,7 +323,17 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsProcessed() (controller.Operat
 		return controller.RequeueWithError(err)
 	}
 
-	if pipelineRun == nil || !a.release.IsTenantCollectorsPipelineProcessed() {
+	tenantRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return controller.RequeueWithError(err)
+	}
+
+	secretRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return controller.RequeueWithError(err)
+	}
+
+	if pipelineRun == nil || !a.release.IsTenantCollectorsPipelineProcessedSuccessfully() {
 		releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
 		if err != nil {
 			return controller.RequeueWithError(err)
@@ -287,6 +353,22 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsProcessed() (controller.Operat
 		}
 
 		if pipelineRun == nil {
+			if releasePlan.Spec.Collectors.ServiceAccountName != "" {
+				if tenantRoleBinding == nil {
+					tenantRoleBinding, err = a.createRoleBindingForClusterRole("release-pipeline-resource-role", releasePlan.Namespace, releasePlan.Spec.Collectors.ServiceAccountName, releasePlan.Namespace)
+					if err != nil {
+						return controller.RequeueWithError(err)
+					}
+				}
+
+				if secretRoleBinding == nil && releasePlan.Spec.Collectors.Secrets != nil {
+					secretRoleBinding, err = a.createRoleBindingForCollectorSecrets("tenant-collectors", releasePlan.Namespace, releasePlan.Spec.Collectors.ServiceAccountName, releasePlan.Spec.Collectors.Secrets)
+					if err != nil {
+						return controller.RequeueWithError(err)
+					}
+				}
+			}
+
 			pipelineRun, err = a.createTenantCollectorsPipelineRun(releasePlan, releasePlanAdmission)
 			if err != nil {
 				return controller.RequeueWithError(err)
@@ -296,7 +378,7 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsProcessed() (controller.Operat
 				"PipelineRun.Name", pipelineRun.Name, "PipelineRun.Namespace", pipelineRun.Namespace)
 		}
 
-		return controller.RequeueOnErrorOrContinue(a.registerTenantCollectorsProcessingData(pipelineRun))
+		return controller.RequeueOnErrorOrContinue(a.registerTenantCollectorsProcessingData(pipelineRun, tenantRoleBinding, secretRoleBinding))
 	}
 
 	return controller.ContinueProcessing()
@@ -328,6 +410,13 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsTracked() (controller.Operatio
 func (a *adapter) EnsureTenantPipelineIsProcessed() (controller.OperationResult, error) {
 	if a.release.HasTenantPipelineProcessingFinished() || !a.release.HasManagedCollectorsPipelineProcessingFinished() {
 		return controller.ContinueProcessing()
+	}
+
+	if a.release.IsFailed() {
+		// release failed, so we skip the tenant pipeline processing
+		patch := client.MergeFrom(a.release.DeepCopy())
+		a.release.MarkTenantPipelineProcessingSkipped()
+		return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
 	}
 
 	pipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, metadata.TenantPipelineType)
@@ -372,9 +461,15 @@ func (a *adapter) EnsureTenantPipelineIsProcessed() (controller.OperationResult,
 // EnsureManagedPipelineIsProcessed is an operation that will ensure that a managed Release PipelineRun associated to the Release
 // being processed and a RoleBinding to grant its serviceAccount permissions exist. Otherwise, it will create them.
 func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult, error) {
-	if a.release.HasManagedPipelineProcessingFinished() || !a.release.HasTenantPipelineProcessingFinished() ||
-		!a.release.IsTenantPipelineProcessed() {
+	if a.release.HasManagedPipelineProcessingFinished() || !a.release.HasTenantPipelineProcessingFinished() {
 		return controller.ContinueProcessing()
+	}
+
+	if a.release.IsFailed() {
+		// release is marked as failed, so we skip the managed pipeline processing
+		patch := client.MergeFrom(a.release.DeepCopy())
+		a.release.MarkManagedPipelineProcessingSkipped()
+		return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
 	}
 
 	pipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, metadata.ManagedPipelineType)
@@ -382,8 +477,9 @@ func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult
 		return controller.RequeueWithError(err)
 	}
 
-	roleBinding, _ := a.loader.GetRoleBindingFromReleaseStatus(a.ctx, a.client, a.release)
-	if err != nil && !errors.IsNotFound(err) && !strings.Contains(err.Error(), "valid reference to a RoleBinding") {
+	// Get RoleBinding from tenant namespace so the managed PipelineRun can access tenant resources.
+	tenantRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.ManagedProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
 		return controller.RequeueWithError(err)
 	}
 
@@ -408,9 +504,9 @@ func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult
 			}
 
 			// Only create a RoleBinding if a ServiceAccount is specified
-			if roleBinding == nil && resources.ReleasePlanAdmission.Spec.Pipeline.ServiceAccountName != "" {
+			if tenantRoleBinding == nil && resources.ReleasePlanAdmission.Spec.Pipeline.ServiceAccountName != "" {
 				// This string should probably be a constant somewhere
-				roleBinding, err = a.createRoleBindingForClusterRole("release-pipeline-resource-role", resources.ReleasePlanAdmission)
+				tenantRoleBinding, err = a.createRoleBindingForClusterRole("release-pipeline-resource-role", resources.ReleasePlanAdmission.Spec.Origin, resources.ReleasePlanAdmission.Spec.Pipeline.ServiceAccountName, resources.ReleasePlanAdmission.Namespace)
 				if err != nil {
 					return controller.RequeueWithError(err)
 				}
@@ -425,7 +521,7 @@ func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult
 				"PipelineRun.Name", pipelineRun.Name, "PipelineRun.Namespace", pipelineRun.Namespace)
 		}
 
-		return controller.RequeueOnErrorOrContinue(a.registerManagedProcessingData(pipelineRun, roleBinding))
+		return controller.RequeueOnErrorOrContinue(a.registerManagedProcessingData(pipelineRun, tenantRoleBinding))
 	}
 
 	return controller.ContinueProcessing()
@@ -477,19 +573,9 @@ func (a *adapter) EnsureFinalPipelineIsProcessed() (controller.OperationResult, 
 	return controller.ContinueProcessing()
 }
 
-// EnsureApplicationMetadataIsSet is an operation that will ensure that the owner reference is set
-// to be the application the Release was created for and that all annotations and labels from the
+// EnsureApplicationMetadataIsSet is an operation that will ensure that all annotations and labels from the
 // Snapshot pertaining to Pipelines as Code or the RhtapDomain prefix are copied to the Release.
 func (a *adapter) EnsureApplicationMetadataIsSet() (controller.OperationResult, error) {
-	if len(a.release.OwnerReferences) > 0 {
-		return controller.ContinueProcessing()
-	}
-
-	releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
-	if err != nil {
-		return controller.RequeueWithError(err)
-	}
-
 	snapshot, err := a.loader.GetSnapshot(a.ctx, a.client, a.release)
 	if err != nil {
 		return controller.RequeueWithError(err)
@@ -497,24 +583,27 @@ func (a *adapter) EnsureApplicationMetadataIsSet() (controller.OperationResult, 
 
 	patch := client.MergeFrom(a.release.DeepCopy())
 
-	application, err := a.loader.GetApplication(a.ctx, a.client, releasePlan)
-	if err != nil {
-		a.release.MarkReleaseFailed("This Release is for a nonexistent Application")
-		return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
-	}
-
-	err = ctrl.SetControllerReference(application, a.release, a.client.Scheme())
+	// Propagate PaC annotations and labels
+	err = toolkitmetadata.CopyAnnotationsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.PipelinesAsCodePrefix)
 	if err != nil {
 		return controller.RequeueWithError(err)
 	}
 
-	// Propagate PaC annotations and labels
-	_ = toolkitmetadata.CopyAnnotationsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.PipelinesAsCodePrefix)
-	_ = toolkitmetadata.CopyLabelsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.PipelinesAsCodePrefix)
+	err = toolkitmetadata.CopyLabelsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.PipelinesAsCodePrefix)
+	if err != nil {
+		return controller.RequeueWithError(err)
+	}
 
 	// Propagate annotations and labels prefixed with the RhtapDomain prefix
-	_ = toolkitmetadata.CopyAnnotationsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.RhtapDomain)
-	_ = toolkitmetadata.CopyLabelsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.RhtapDomain)
+	err = toolkitmetadata.CopyAnnotationsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.RhtapDomain)
+	if err != nil {
+		return controller.RequeueWithError(err)
+	}
+
+	err = toolkitmetadata.CopyLabelsByPrefix(&snapshot.ObjectMeta, &a.release.ObjectMeta, metadata.RhtapDomain)
+	if err != nil {
+		return controller.RequeueWithError(err)
+	}
 
 	err = a.client.Patch(a.ctx, a.release, patch)
 	if err != nil && !errors.IsNotFound(err) {
@@ -560,6 +649,12 @@ func (a *adapter) EnsureReleaseIsValid() (controller.OperationResult, error) {
 	// IsReleasing will be false if MarkReleaseFailed was called
 	if a.release.IsReleasing() {
 		a.release.MarkValidated()
+		return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
+	}
+
+	if !a.release.AreAllProcessingPhasesFinished() {
+		a.logger.Info("EnsureReleaseIsValid: release finished but not all phases finished, continuing so we can complete properly",
+			"Release", fmt.Sprintf("%s/%s", a.release.Namespace, a.release.Name))
 		return controller.RequeueOnErrorOrContinue(a.client.Status().Patch(a.ctx, a.release, patch))
 	}
 
@@ -629,37 +724,233 @@ func (a *adapter) EnsureFinalPipelineProcessingIsTracked() (controller.Operation
 	return controller.ContinueProcessing()
 }
 
+// EnsureCollectorsProcessingResourcesAreCleanedUp is an operation that will ensure that the RoleBindings, Roles, and PipelineRuns created for the Collectors
+// Processing step are cleaned up once processing is finished.
+func (a *adapter) EnsureCollectorsProcessingResourcesAreCleanedUp() (controller.OperationResult, error) {
+	if !a.release.HasTenantCollectorsPipelineProcessingFinished() || !a.release.HasManagedCollectorsPipelineProcessingFinished() {
+		return controller.ContinueProcessing()
+	}
+
+	var cleanupErrors []error
+
+	// Cleanup Tenant Collector PipelineRun and RoleBinding resources.
+	tenantCollectorsPipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, metadata.TenantCollectorsPipelineType)
+	if err != nil && !errors.IsNotFound(err) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get tenant collectors pipeline: %w", err))
+	}
+
+	tenantCollectorsTenantRB, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get tenant collectors tenant rolebinding: %w", err))
+	}
+
+	tenantCollectorsSecretRB, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get tenant collectors secret rolebinding: %w", err))
+	}
+
+	err = a.cleanupPipelineResources(tenantCollectorsPipelineRun, tenantCollectorsTenantRB, tenantCollectorsSecretRB)
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("tenant collectors cleanup failed: %w", err))
+	}
+
+	// Cleanup Managed Collector PipelineRun and RoleBinding resources.
+	managedCollectorsPipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, metadata.ManagedCollectorsPipelineType)
+	if err != nil && !errors.IsNotFound(err) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get managed collectors pipeline: %w", err))
+	}
+
+	managedCollectorsTenantRB, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get managed collectors tenant rolebinding: %w", err))
+	}
+
+	managedCollectorsManagedRB, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "managed")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get managed collectors managed rolebinding: %w", err))
+	}
+
+	managedCollectorsSecretRB, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("failed to get managed collectors secret rolebinding: %w", err))
+	}
+
+	err = a.cleanupPipelineResources(managedCollectorsPipelineRun, managedCollectorsTenantRB, managedCollectorsManagedRB, managedCollectorsSecretRB)
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("managed collectors cleanup failed: %w", err))
+	}
+
+	if len(cleanupErrors) > 0 {
+		for _, cleanupErr := range cleanupErrors {
+			if loader.IsRetriable(cleanupErr) {
+				return controller.RequeueWithError(fmt.Errorf("cleanup failed: %v", cleanupErrors))
+			}
+		}
+		a.logger.Error(fmt.Errorf("cleanup errors: %v", cleanupErrors),
+			"Non-retriable collector cleanup errors occurred, continuing")
+	}
+
+	return controller.ContinueProcessing()
+}
+
 // EnsureReleaseProcessingResourcesAreCleanedUp is an operation that will ensure that the resources created for the Release
 // Processing step are cleaned up once processing is finished. This exists in conjunction with EnsureFinalizersAreCalled because
 // the finalizers should be removed from the pipelineRuns even if the Release is not marked for deletion for quota reasons.
 func (a *adapter) EnsureReleaseProcessingResourcesAreCleanedUp() (controller.OperationResult, error) {
-	if !a.release.HasTenantPipelineProcessingFinished() || !a.release.HasManagedPipelineProcessingFinished() || !a.release.HasFinalPipelineProcessingFinished() {
+	var cleanupErrors []error
+
+	if !a.release.HasTenantPipelineProcessingFinished() {
 		return controller.ContinueProcessing()
 	}
 
-	return controller.RequeueOnErrorOrContinue(a.finalizeRelease(false))
+	if err := a.cleanupPipeline(metadata.TenantPipelineType); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("tenant pipeline cleanup failed: %w", err))
+	}
+
+	if !a.release.HasManagedPipelineProcessingFinished() {
+		return controller.ContinueProcessing()
+	}
+
+	if err := a.cleanupPipeline(metadata.ManagedPipelineType); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("managed pipeline cleanup failed: %w", err))
+	}
+
+	if !a.release.HasFinalPipelineProcessingFinished() {
+		return controller.ContinueProcessing()
+	}
+
+	if err := a.cleanupPipeline(metadata.FinalPipelineType); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("final pipeline cleanup failed: %w", err))
+	}
+
+	if len(cleanupErrors) > 0 {
+		for _, cleanupErr := range cleanupErrors {
+			if loader.IsRetriable(cleanupErr) {
+				return controller.RequeueWithError(fmt.Errorf("cleanup failed: %v", cleanupErrors))
+			}
+		}
+		a.logger.Error(fmt.Errorf("cleanup errors: %v", cleanupErrors),
+			"Non-retriable pipeline cleanup errors occurred, continuing")
+	}
+
+	return controller.ContinueProcessing()
+}
+
+// cleanupPipeline handles pipeline cleanup for any pipeline type
+func (a *adapter) cleanupPipeline(pipelineType metadata.PipelineType) error {
+	// Get the pipeline run
+	pipelineRun, err := a.loader.GetReleasePipelineRun(a.ctx, a.client, a.release, pipelineType)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	if pipelineRun == nil {
+		return nil
+	}
+
+	// Get role bindings based on pipeline type
+	var roleBindings []*rbac.RoleBinding
+	if pipelineType == metadata.ManagedPipelineType {
+		tenantRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.ManagedProcessing, "tenant")
+		if err == nil && tenantRoleBinding != nil {
+			roleBindings = append(roleBindings, tenantRoleBinding)
+		}
+	} else if pipelineType != metadata.TenantPipelineType && pipelineType != metadata.FinalPipelineType {
+		return fmt.Errorf("unsupported pipeline type: %s", pipelineType.String())
+	}
+
+	return a.cleanupPipelineResources(pipelineRun, roleBindings...)
+}
+
+// cleanupPipelineResources - Simple one-shot cleanup (no retries, orphaned cleanup will handle failures)
+func (a *adapter) cleanupPipelineResources(pipelineRun *tektonv1.PipelineRun, roleBindings ...*rbac.RoleBinding) error {
+	err := a.cleanupProcessingResources(pipelineRun, roleBindings...)
+	if err != nil && !errors.IsNotFound(err) {
+		pipelineRunName := "unknown"
+		if pipelineRun != nil {
+			pipelineRunName = pipelineRun.Name
+		}
+		a.logger.Error(err, "Pipeline cleanup failed", "pipelineRun", pipelineRunName)
+		return err
+	}
+
+	if err == nil {
+		pipelineRunName := "unknown"
+		if pipelineRun != nil {
+			pipelineRunName = pipelineRun.Name
+		}
+		a.logger.Info("Pipeline cleanup successful", "pipelineRun", pipelineRunName)
+	}
+	return nil
 }
 
 // cleanupProcessingResources removes the finalizer from the PipelineRun created for the Release Processing
-// and removes the roleBinding that was created in order for the PipelineRun to succeed.
-func (a *adapter) cleanupProcessingResources(pipelineRun *tektonv1.PipelineRun, roleBinding *rbac.RoleBinding) error {
-	if roleBinding != nil {
+// and removes the roleBindings and roles that was created in order for the PipelineRun to succeed.
+func (a *adapter) cleanupProcessingResources(pipelineRun *tektonv1.PipelineRun, roleBindings ...*rbac.RoleBinding) error {
+	for _, roleBinding := range roleBindings {
+		if roleBinding == nil {
+			continue
+		}
+
 		err := a.client.Delete(a.ctx, roleBinding)
-		if err != nil {
-			return err
+		if err != nil && !errors.IsNotFound(err) && !errors.IsForbidden(err) {
+			a.logger.V(1).Info("Failed to delete RoleBinding, continuing with finalizer removal",
+				"roleBinding", roleBinding.Name,
+				"namespace", roleBinding.Namespace,
+				"error", err.Error())
+		}
+
+		if roleBinding.RoleRef.Kind == "Role" {
+			role := &rbac.Role{}
+			err := a.client.Get(a.ctx, types.NamespacedName{
+				Namespace: roleBinding.Namespace,
+				Name:      roleBinding.RoleRef.Name,
+			}, role)
+			if err == nil {
+				err = a.client.Delete(a.ctx, role)
+				if err != nil && !errors.IsNotFound(err) && !errors.IsForbidden(err) {
+					a.logger.V(1).Info("Failed to delete Role, continuing with finalizer removal",
+						"role", role.Name,
+						"namespace", role.Namespace,
+						"error", err.Error())
+				}
+			}
 		}
 	}
 
 	if pipelineRun != nil {
 		if controllerutil.ContainsFinalizer(pipelineRun, metadata.ReleaseFinalizer) {
-			patch := client.MergeFrom(pipelineRun.DeepCopy())
-			removedFinalizer := controllerutil.RemoveFinalizer(pipelineRun, metadata.ReleaseFinalizer)
-			if !removedFinalizer {
-				return fmt.Errorf("finalizer not removed")
-			}
-			err := a.client.Patch(a.ctx, pipelineRun, patch)
+			freshPipelineRun := &tektonv1.PipelineRun{}
+			err := a.client.Get(a.ctx, client.ObjectKeyFromObject(pipelineRun), freshPipelineRun)
 			if err != nil {
+				if errors.IsNotFound(err) {
+					return nil
+				}
 				return err
+			}
+
+			if controllerutil.ContainsFinalizer(freshPipelineRun, metadata.ReleaseFinalizer) {
+				newFinalizers := []string{}
+				for _, f := range freshPipelineRun.GetFinalizers() {
+					if f != metadata.ReleaseFinalizer {
+						newFinalizers = append(newFinalizers, f)
+					}
+				}
+
+				patchPayload := map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"finalizers": newFinalizers,
+					},
+				}
+				patchBytes, err := json.Marshal(patchPayload)
+				if err != nil {
+					return err
+				}
+
+				err = a.client.Patch(a.ctx, freshPipelineRun,
+					client.RawPatch(types.MergePatchType, patchBytes))
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -668,7 +959,7 @@ func (a *adapter) cleanupProcessingResources(pipelineRun *tektonv1.PipelineRun, 
 }
 
 // getCollectorsPipelineRunBuilder generates a builder to use while creating a collectors PipelineRun.
-func (a *adapter) getCollectorsPipelineRunBuilder(pipelineType, namespace, url string, revision string) *utils.PipelineRunBuilder {
+func (a *adapter) getCollectorsPipelineRunBuilder(pipelineType metadata.PipelineType, namespace, url string, revision string) *utils.PipelineRunBuilder {
 	previousRelease, err := a.loader.GetPreviousRelease(a.ctx, a.client, a.release)
 	previousReleaseNamespaceName := ""
 	if err == nil && previousRelease != nil {
@@ -676,11 +967,11 @@ func (a *adapter) getCollectorsPipelineRunBuilder(pipelineType, namespace, url s
 			previousRelease.Namespace, types.Separator, previousRelease.Name)
 	}
 
-	return utils.NewPipelineRunBuilder(pipelineType, namespace).
+	return utils.NewPipelineRunBuilder(pipelineType.String(), namespace).
 		WithAnnotations(metadata.GetAnnotationsWithPrefix(a.release, integrationgitops.PipelinesAsCodePrefix)).
 		WithFinalizer(metadata.ReleaseFinalizer).
 		WithLabels(map[string]string{
-			metadata.PipelinesTypeLabel:    pipelineType,
+			metadata.PipelinesTypeLabel:    pipelineType.String(),
 			metadata.ServiceNameLabel:      metadata.ServiceName,
 			metadata.ReleaseNameLabel:      a.release.Name,
 			metadata.ReleaseNamespaceLabel: a.release.Namespace,
@@ -750,7 +1041,6 @@ func (a *adapter) createManagedCollectorsPipelineRun(releasePlanAdmission *v1alp
 		).
 		WithServiceAccount(releasePlanAdmission.Spec.Collectors.ServiceAccountName).
 		Build()
-
 	if err != nil {
 		return nil, err
 	}
@@ -801,7 +1091,6 @@ func (a *adapter) createTenantCollectorsPipelineRun(releasePlan *v1alpha1.Releas
 		).
 		WithServiceAccount(releasePlan.Spec.Collectors.ServiceAccountName).
 		Build()
-
 	if err != nil {
 		return nil, err
 	}
@@ -819,12 +1108,12 @@ func (a *adapter) createTenantCollectorsPipelineRun(releasePlan *v1alpha1.Releas
 // will be extracted from the given ReleasePlan. The Release's Snapshot will also be passed to the release
 // PipelineRun.
 func (a *adapter) createFinalPipelineRun(releasePlan *v1alpha1.ReleasePlan, snapshot *applicationapiv1alpha1.Snapshot) (*tektonv1.PipelineRun, error) {
-	pipelineRun, err := utils.NewPipelineRunBuilder(metadata.FinalPipelineType, releasePlan.Namespace).
+	builder := utils.NewPipelineRunBuilder(metadata.FinalPipelineType.String(), releasePlan.Namespace).
 		WithAnnotations(metadata.GetAnnotationsWithPrefix(a.release, integrationgitops.PipelinesAsCodePrefix)).
 		WithFinalizer(metadata.ReleaseFinalizer).
 		WithLabels(map[string]string{
 			metadata.ApplicationNameLabel:  releasePlan.Spec.Application,
-			metadata.PipelinesTypeLabel:    metadata.FinalPipelineType,
+			metadata.PipelinesTypeLabel:    metadata.FinalPipelineType.String(),
 			metadata.ServiceNameLabel:      metadata.ServiceName,
 			metadata.ReleaseNameLabel:      a.release.Name,
 			metadata.ReleaseNamespaceLabel: a.release.Namespace,
@@ -836,13 +1125,22 @@ func (a *adapter) createFinalPipelineRun(releasePlan *v1alpha1.ReleasePlan, snap
 		WithPipelineRef(releasePlan.Spec.FinalPipeline.PipelineRef.ToTektonPipelineRef()).
 		WithServiceAccount(releasePlan.Spec.FinalPipeline.ServiceAccountName).
 		WithTaskRunSpecs(releasePlan.Spec.FinalPipeline.TaskRunSpecs...).
-		WithTimeouts(&releasePlan.Spec.FinalPipeline.Timeouts, &a.releaseServiceConfig.Spec.DefaultTimeouts).
-		WithWorkspaceFromVolumeTemplate(
+		WithTimeouts(utils.AdjustTimeouts(&releasePlan.Spec.FinalPipeline.Timeouts, *a.logger), &a.releaseServiceConfig.Spec.DefaultTimeouts)
+
+	if releasePlan.Spec.FinalPipeline.PipelineRef.UseEmptyDir {
+		builder = builder.WithEmptyDirVolume(
 			os.Getenv("DEFAULT_RELEASE_WORKSPACE_NAME"),
 			os.Getenv("DEFAULT_RELEASE_WORKSPACE_SIZE"),
-		).
-		Build()
+		)
+	} else {
+		builder = builder.WithWorkspaceFromVolumeTemplate(
+			os.Getenv("DEFAULT_RELEASE_WORKSPACE_NAME"),
+			os.Getenv("DEFAULT_RELEASE_WORKSPACE_SIZE"),
+		)
+	}
 
+	var pipelineRun *tektonv1.PipelineRun
+	pipelineRun, err := builder.Build()
 	if err != nil {
 		return nil, err
 	}
@@ -860,12 +1158,12 @@ func (a *adapter) createFinalPipelineRun(releasePlan *v1alpha1.ReleasePlan, snap
 // will be extracted from the given ReleasePlanAdmission. The Release's Snapshot will also be passed to the release
 // PipelineRun.
 func (a *adapter) createManagedPipelineRun(resources *loader.ProcessingResources) (*tektonv1.PipelineRun, error) {
-	builder := utils.NewPipelineRunBuilder(metadata.ManagedPipelineType, resources.ReleasePlanAdmission.Namespace).
+	builder := utils.NewPipelineRunBuilder(metadata.ManagedPipelineType.String(), resources.ReleasePlanAdmission.Namespace).
 		WithAnnotations(metadata.GetAnnotationsWithPrefix(a.release, integrationgitops.PipelinesAsCodePrefix)).
 		WithFinalizer(metadata.ReleaseFinalizer).
 		WithLabels(map[string]string{
 			metadata.ApplicationNameLabel:  resources.ReleasePlan.Spec.Application,
-			metadata.PipelinesTypeLabel:    metadata.ManagedPipelineType,
+			metadata.PipelinesTypeLabel:    metadata.ManagedPipelineType.String(),
 			metadata.ServiceNameLabel:      metadata.ServiceName,
 			metadata.ReleaseNameLabel:      a.release.Name,
 			metadata.ReleaseNamespaceLabel: a.release.Namespace,
@@ -876,10 +1174,12 @@ func (a *adapter) createManagedPipelineRun(resources *loader.ProcessingResources
 		WithObjectSpecsAsJson(resources.EnterpriseContractPolicy).
 		WithOwner(a.release).
 		WithParamsFromConfigMap(resources.EnterpriseContractConfigMap, []string{"verify_ec_task_bundle"}).
+		WithParamsFromConfigMap(resources.EnterpriseContractConfigMap, []string{"verify_ec_task_git_revision"}).
 		WithPipelineRef(resources.ReleasePlanAdmission.Spec.Pipeline.PipelineRef.ToTektonPipelineRef()).
 		WithServiceAccount(resources.ReleasePlanAdmission.Spec.Pipeline.ServiceAccountName).
 		WithTaskRunSpecs(resources.ReleasePlanAdmission.Spec.Pipeline.TaskRunSpecs...).
-		WithTimeouts(&resources.ReleasePlanAdmission.Spec.Pipeline.Timeouts, &a.releaseServiceConfig.Spec.DefaultTimeouts)
+		WithTimeouts(utils.AdjustTimeouts(&resources.ReleasePlanAdmission.Spec.Pipeline.Timeouts, *a.logger), &a.releaseServiceConfig.Spec.DefaultTimeouts).
+		WithParams(resources.ReleasePlanAdmission.Spec.Pipeline.GetOciStorageParam()...)
 
 	url, revision, pathInRepo, err := resources.ReleasePlanAdmission.Spec.Pipeline.PipelineRef.GetGitResolverParams()
 	if err == nil && a.releaseServiceConfig.IsPipelineOverridden(url, revision, pathInRepo) {
@@ -913,12 +1213,12 @@ func (a *adapter) createManagedPipelineRun(resources *loader.ProcessingResources
 // will be extracted from the given ReleasePlan. The Release's Snapshot will also be passed to the release
 // PipelineRun.
 func (a *adapter) createTenantPipelineRun(releasePlan *v1alpha1.ReleasePlan, snapshot *applicationapiv1alpha1.Snapshot) (*tektonv1.PipelineRun, error) {
-	pipelineRun, err := utils.NewPipelineRunBuilder(metadata.TenantPipelineType, releasePlan.Namespace).
+	builder := utils.NewPipelineRunBuilder(metadata.TenantPipelineType.String(), releasePlan.Namespace).
 		WithAnnotations(metadata.GetAnnotationsWithPrefix(a.release, integrationgitops.PipelinesAsCodePrefix)).
 		WithFinalizer(metadata.ReleaseFinalizer).
 		WithLabels(map[string]string{
 			metadata.ApplicationNameLabel:  releasePlan.Spec.Application,
-			metadata.PipelinesTypeLabel:    metadata.TenantPipelineType,
+			metadata.PipelinesTypeLabel:    metadata.TenantPipelineType.String(),
 			metadata.ServiceNameLabel:      metadata.ServiceName,
 			metadata.ReleaseNameLabel:      a.release.Name,
 			metadata.ReleaseNamespaceLabel: a.release.Namespace,
@@ -930,13 +1230,22 @@ func (a *adapter) createTenantPipelineRun(releasePlan *v1alpha1.ReleasePlan, sna
 		WithPipelineRef(releasePlan.Spec.TenantPipeline.PipelineRef.ToTektonPipelineRef()).
 		WithServiceAccount(releasePlan.Spec.TenantPipeline.ServiceAccountName).
 		WithTaskRunSpecs(releasePlan.Spec.TenantPipeline.TaskRunSpecs...).
-		WithTimeouts(&releasePlan.Spec.TenantPipeline.Timeouts, &a.releaseServiceConfig.Spec.DefaultTimeouts).
-		WithWorkspaceFromVolumeTemplate(
+		WithTimeouts(utils.AdjustTimeouts(&releasePlan.Spec.TenantPipeline.Timeouts, *a.logger), &a.releaseServiceConfig.Spec.DefaultTimeouts)
+
+	if releasePlan.Spec.TenantPipeline.PipelineRef.UseEmptyDir {
+		builder = builder.WithEmptyDirVolume(
 			os.Getenv("DEFAULT_RELEASE_WORKSPACE_NAME"),
 			os.Getenv("DEFAULT_RELEASE_WORKSPACE_SIZE"),
-		).
-		Build()
+		)
+	} else {
+		builder = builder.WithWorkspaceFromVolumeTemplate(
+			os.Getenv("DEFAULT_RELEASE_WORKSPACE_NAME"),
+			os.Getenv("DEFAULT_RELEASE_WORKSPACE_SIZE"),
+		)
+	}
 
+	var pipelineRun *tektonv1.PipelineRun
+	pipelineRun, err := builder.Build()
 	if err != nil {
 		return nil, err
 	}
@@ -949,14 +1258,63 @@ func (a *adapter) createTenantPipelineRun(releasePlan *v1alpha1.ReleasePlan, sna
 	return pipelineRun, nil
 }
 
-// createRoleBindingForClusterRole creates a RoleBinding that binds the serviceAccount from the passed
-// ReleasePlanAdmission to the passed ClusterRole. If the creation fails, the error is returned. If the creation
-// is successful, the RoleBinding is returned.
-func (a *adapter) createRoleBindingForClusterRole(clusterRole string, releasePlanAdmission *v1alpha1.ReleasePlanAdmission) (*rbac.RoleBinding, error) {
+// createRoleBindingForCollectorSecrets creates a Role and RoleBinding that grants the specified
+// serviceAccount get access to the given secrets in the provided namespace. If the creation fails,
+// the error is returned. If the creation is successful, the RoleBinding is returned.
+func (a *adapter) createRoleBindingForCollectorSecrets(collectorType, namespace, serviceAccount string, secrets []string) (*rbac.RoleBinding, error) {
+	role := &rbac.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-role-for-%s-", a.release.Name, collectorType),
+			Namespace:    namespace,
+		},
+		Rules: []rbac.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: secrets,
+				Verbs:         []string{"get"},
+			},
+		},
+	}
+
+	if err := a.client.Create(a.ctx, role); err != nil {
+		return nil, err
+	}
+
+	roleBinding := &rbac.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-rolebinding-for-%s-", a.release.Name, collectorType),
+			Namespace:    namespace,
+		},
+		RoleRef: rbac.RoleRef{
+			APIGroup: rbac.GroupName,
+			Kind:     "Role",
+			Name:     role.Name,
+		},
+		Subjects: []rbac.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      serviceAccount,
+				Namespace: namespace,
+			},
+		},
+	}
+
+	if err := a.client.Create(a.ctx, roleBinding); err != nil {
+		return nil, err
+	}
+
+	return roleBinding, nil
+}
+
+// createRoleBindingForClusterRole creates a RoleBinding that binds a ServiceAccount from the specified
+// serviceAccountNamespace to a ClusterRole in the specified roleBindingNamespace.
+// If the creation fails, the error is returned. If the creation is successful, the RoleBinding is returned.
+func (a *adapter) createRoleBindingForClusterRole(clusterRole, roleBindingNamespace, serviceAccountName, serviceAccountNamespace string) (*rbac.RoleBinding, error) {
 	roleBinding := &rbac.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("%s-rolebinding-for-%s-", a.release.Name, clusterRole),
-			Namespace:    releasePlanAdmission.Spec.Origin,
+			Namespace:    roleBindingNamespace,
 		},
 		RoleRef: rbac.RoleRef{
 			APIGroup: rbac.GroupName,
@@ -966,19 +1324,13 @@ func (a *adapter) createRoleBindingForClusterRole(clusterRole string, releasePla
 		Subjects: []rbac.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      releasePlanAdmission.Spec.Pipeline.ServiceAccountName,
-				Namespace: releasePlanAdmission.Namespace,
+				Name:      serviceAccountName,
+				Namespace: serviceAccountNamespace,
 			},
 		},
 	}
 
-	// Set ownerRef so it is deleted if the Release is deleted
-	err := ctrl.SetControllerReference(a.release, roleBinding, a.client.Scheme())
-	if err != nil {
-		return nil, err
-	}
-
-	err = a.client.Create(a.ctx, roleBinding)
+	err := a.client.Create(a.ctx, roleBinding)
 	if err != nil {
 		return nil, err
 	}
@@ -997,7 +1349,22 @@ func (a *adapter) finalizeRelease(delete bool) error {
 		return err
 	}
 
-	err = a.cleanupProcessingResources(managedCollectorsPipelineRun, nil)
+	tenantRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return err
+	}
+
+	managedRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "managed")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return err
+	}
+
+	secretRoleBinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return err
+	}
+
+	err = a.cleanupProcessingResources(managedCollectorsPipelineRun, tenantRoleBinding, managedRoleBinding, secretRoleBinding)
 	if err != nil {
 		return err
 	}
@@ -1015,7 +1382,17 @@ func (a *adapter) finalizeRelease(delete bool) error {
 		return err
 	}
 
-	err = a.cleanupProcessingResources(tenantCollectorsPipelineRun, nil)
+	tenantRoleBinding, err = a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return err
+	}
+
+	secretRoleBinding, err = a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.CollectorsProcessing.TenantCollectorsProcessing, "secret")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
+		return err
+	}
+
+	err = a.cleanupProcessingResources(tenantCollectorsPipelineRun, tenantRoleBinding, secretRoleBinding)
 	if err != nil {
 		return err
 	}
@@ -1051,12 +1428,12 @@ func (a *adapter) finalizeRelease(delete bool) error {
 		return err
 	}
 
-	roleBinding, err := a.loader.GetRoleBindingFromReleaseStatus(a.ctx, a.client, a.release)
-	if err != nil && !errors.IsNotFound(err) && !strings.Contains(err.Error(), "valid reference to a RoleBinding") {
+	tenantRolebinding, err := a.loader.GetRoleBindingFromReleaseStatusPipelineInfo(a.ctx, a.client, &a.release.Status.ManagedProcessing, "tenant")
+	if err != nil && !errors.IsNotFound(err) && !stderrors.Is(err, loader.ErrInvalidRoleBindingRef) {
 		return err
 	}
 
-	err = a.cleanupProcessingResources(managedPipelineRun, roleBinding)
+	err = a.cleanupProcessingResources(managedPipelineRun, tenantRolebinding)
 	if err != nil {
 		return err
 	}
@@ -1105,7 +1482,7 @@ func (a *adapter) getEmptyReleaseServiceConfig(namespace string) *v1alpha1.Relea
 
 // registerTenantCollectorsProcessingData adds all the Release Tenant Collectors processing information to its Status
 // and marks it as tenant collectors processing.
-func (a *adapter) registerTenantCollectorsProcessingData(releasePipelineRun *tektonv1.PipelineRun) error {
+func (a *adapter) registerTenantCollectorsProcessingData(releasePipelineRun *tektonv1.PipelineRun, tenantRoleBinding *rbac.RoleBinding, secretRoleBinding *rbac.RoleBinding) error {
 	if releasePipelineRun == nil {
 		return nil
 	}
@@ -1114,6 +1491,14 @@ func (a *adapter) registerTenantCollectorsProcessingData(releasePipelineRun *tek
 
 	a.release.Status.CollectorsProcessing.TenantCollectorsProcessing.PipelineRun = fmt.Sprintf("%s%c%s",
 		releasePipelineRun.Namespace, types.Separator, releasePipelineRun.Name)
+	if tenantRoleBinding != nil {
+		a.release.Status.CollectorsProcessing.TenantCollectorsProcessing.RoleBindings.TenantRoleBinding = fmt.Sprintf("%s%c%s",
+			tenantRoleBinding.Namespace, types.Separator, tenantRoleBinding.Name)
+	}
+	if secretRoleBinding != nil {
+		a.release.Status.CollectorsProcessing.TenantCollectorsProcessing.RoleBindings.SecretRoleBinding = fmt.Sprintf("%s%c%s",
+			secretRoleBinding.Namespace, types.Separator, secretRoleBinding.Name)
+	}
 
 	a.release.MarkTenantCollectorsPipelineProcessing()
 
@@ -1154,7 +1539,7 @@ func (a *adapter) registerFinalProcessingData(releasePipelineRun *tektonv1.Pipel
 
 // registerManagedCollectorsProcessingData adds all the Release Managed Collectors processing information to its Status
 // and marks it as managed collectors processing.
-func (a *adapter) registerManagedCollectorsProcessingData(releasePipelineRun *tektonv1.PipelineRun) error {
+func (a *adapter) registerManagedCollectorsProcessingData(releasePipelineRun *tektonv1.PipelineRun, tenantRoleBinding *rbac.RoleBinding, managedRoleBinding *rbac.RoleBinding, secretRoleBinding *rbac.RoleBinding) error {
 	if releasePipelineRun == nil {
 		return nil
 	}
@@ -1163,6 +1548,18 @@ func (a *adapter) registerManagedCollectorsProcessingData(releasePipelineRun *te
 
 	a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.PipelineRun = fmt.Sprintf("%s%c%s",
 		releasePipelineRun.Namespace, types.Separator, releasePipelineRun.Name)
+	if tenantRoleBinding != nil {
+		a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.RoleBindings.TenantRoleBinding = fmt.Sprintf("%s%c%s",
+			tenantRoleBinding.Namespace, types.Separator, tenantRoleBinding.Name)
+	}
+	if managedRoleBinding != nil {
+		a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.RoleBindings.ManagedRoleBinding = fmt.Sprintf("%s%c%s",
+			managedRoleBinding.Namespace, types.Separator, managedRoleBinding.Name)
+	}
+	if secretRoleBinding != nil {
+		a.release.Status.CollectorsProcessing.ManagedCollectorsProcessing.RoleBindings.SecretRoleBinding = fmt.Sprintf("%s%c%s",
+			secretRoleBinding.Namespace, types.Separator, secretRoleBinding.Name)
+	}
 
 	a.release.MarkManagedCollectorsPipelineProcessing()
 
@@ -1170,7 +1567,7 @@ func (a *adapter) registerManagedCollectorsProcessingData(releasePipelineRun *te
 }
 
 // registerProcessingData adds all the Release Managed processing information to its Status and marks it as managed processing.
-func (a *adapter) registerManagedProcessingData(releasePipelineRun *tektonv1.PipelineRun, roleBinding *rbac.RoleBinding) error {
+func (a *adapter) registerManagedProcessingData(releasePipelineRun *tektonv1.PipelineRun, tenantRoleBinding *rbac.RoleBinding) error {
 	if releasePipelineRun == nil {
 		return nil
 	}
@@ -1179,9 +1576,9 @@ func (a *adapter) registerManagedProcessingData(releasePipelineRun *tektonv1.Pip
 
 	a.release.Status.ManagedProcessing.PipelineRun = fmt.Sprintf("%s%c%s",
 		releasePipelineRun.Namespace, types.Separator, releasePipelineRun.Name)
-	if roleBinding != nil {
-		a.release.Status.ManagedProcessing.RoleBinding = fmt.Sprintf("%s%c%s",
-			roleBinding.Namespace, types.Separator, roleBinding.Name)
+	if tenantRoleBinding != nil {
+		a.release.Status.ManagedProcessing.RoleBindings.TenantRoleBinding = fmt.Sprintf("%s%c%s",
+			tenantRoleBinding.Namespace, types.Separator, tenantRoleBinding.Name)
 	}
 
 	a.release.MarkManagedPipelineProcessing()
@@ -1193,7 +1590,7 @@ func (a *adapter) registerManagedProcessingData(releasePipelineRun *tektonv1.Pip
 // associated tenant collectors Release PipelineRun and setting the appropriate state in the Release. If the PipelineRun hasn't
 // started/succeeded, no action will be taken.
 func (a *adapter) registerTenantCollectorsProcessingStatus(pipelineRun *tektonv1.PipelineRun) error {
-	if pipelineRun == nil || !pipelineRun.IsDone() {
+	if pipelineRun == nil || !tekton.IsPipelineRunDone(pipelineRun) {
 		return nil
 	}
 
@@ -1203,7 +1600,20 @@ func (a *adapter) registerTenantCollectorsProcessingStatus(pipelineRun *tektonv1
 	if condition.IsTrue() {
 		a.release.MarkTenantCollectorsPipelineProcessed()
 	} else {
-		a.release.MarkTenantCollectorsPipelineProcessingFailed(condition.Message)
+		var message string
+		if pipelineRun.GetDeletionTimestamp() != nil && condition.IsUnknown() {
+			message = "PipelineRun was deleted while still running"
+		} else {
+			var err error
+			message, err = a.getFailedTaskRunLogs(pipelineRun)
+			if err != nil {
+				a.logger.Error(err, "failed to get TaskRun logs for tenant collectors pipeline")
+			}
+			if message == "" {
+				message = condition.Message
+			}
+		}
+		a.release.MarkTenantCollectorsPipelineProcessingFailed(message)
 		a.release.MarkReleaseFailed("Release processing failed on tenant collectors pipelineRun")
 	}
 
@@ -1214,7 +1624,7 @@ func (a *adapter) registerTenantCollectorsProcessingStatus(pipelineRun *tektonv1
 // associated tenant Release PipelineRun and setting the appropriate state in the Release. If the PipelineRun hasn't
 // started/succeeded, no action will be taken.
 func (a *adapter) registerTenantProcessingStatus(pipelineRun *tektonv1.PipelineRun) error {
-	if pipelineRun == nil || !pipelineRun.IsDone() {
+	if pipelineRun == nil || !tekton.IsPipelineRunDone(pipelineRun) {
 		return nil
 	}
 
@@ -1224,7 +1634,20 @@ func (a *adapter) registerTenantProcessingStatus(pipelineRun *tektonv1.PipelineR
 	if condition.IsTrue() {
 		a.release.MarkTenantPipelineProcessed()
 	} else {
-		a.release.MarkTenantPipelineProcessingFailed(condition.Message)
+		var message string
+		if pipelineRun.GetDeletionTimestamp() != nil && condition.IsUnknown() {
+			message = "PipelineRun was deleted while still running"
+		} else {
+			var err error
+			message, err = a.getFailedTaskRunLogs(pipelineRun)
+			if err != nil {
+				a.logger.Error(err, "failed to get TaskRun logs for tenant pipeline")
+			}
+			if message == "" {
+				message = condition.Message
+			}
+		}
+		a.release.MarkTenantPipelineProcessingFailed(message)
 		a.release.MarkReleaseFailed("Release processing failed on tenant pipelineRun")
 	}
 
@@ -1235,7 +1658,7 @@ func (a *adapter) registerTenantProcessingStatus(pipelineRun *tektonv1.PipelineR
 // associated managed collectors Release PipelineRun and setting the appropriate state in the Release. If the PipelineRun hasn't
 // started/succeeded, no action will be taken.
 func (a *adapter) registerManagedCollectorsProcessingStatus(pipelineRun *tektonv1.PipelineRun) error {
-	if pipelineRun == nil || !pipelineRun.IsDone() {
+	if pipelineRun == nil || !tekton.IsPipelineRunDone(pipelineRun) {
 		return nil
 	}
 
@@ -1245,7 +1668,20 @@ func (a *adapter) registerManagedCollectorsProcessingStatus(pipelineRun *tektonv
 	if condition.IsTrue() {
 		a.release.MarkManagedCollectorsPipelineProcessed()
 	} else {
-		a.release.MarkManagedCollectorsPipelineProcessingFailed(condition.Message)
+		var message string
+		if pipelineRun.GetDeletionTimestamp() != nil && condition.IsUnknown() {
+			message = "PipelineRun was deleted while still running"
+		} else {
+			var err error
+			message, err = a.getFailedTaskRunLogs(pipelineRun)
+			if err != nil {
+				a.logger.Error(err, "failed to get TaskRun logs for managed collectors pipeline")
+			}
+			if message == "" {
+				message = condition.Message
+			}
+		}
+		a.release.MarkManagedCollectorsPipelineProcessingFailed(message)
 		a.release.MarkReleaseFailed("Release processing failed on managed collectors pipelineRun")
 	}
 
@@ -1256,7 +1692,7 @@ func (a *adapter) registerManagedCollectorsProcessingStatus(pipelineRun *tektonv
 // associated managed Release PipelineRun and setting the appropriate state in the Release. If the PipelineRun hasn't
 // started/succeeded, no action will be taken.
 func (a *adapter) registerManagedProcessingStatus(pipelineRun *tektonv1.PipelineRun) error {
-	if pipelineRun == nil || !pipelineRun.IsDone() {
+	if pipelineRun == nil || !tekton.IsPipelineRunDone(pipelineRun) {
 		return nil
 	}
 
@@ -1266,7 +1702,20 @@ func (a *adapter) registerManagedProcessingStatus(pipelineRun *tektonv1.Pipeline
 	if condition.IsTrue() {
 		a.release.MarkManagedPipelineProcessed()
 	} else {
-		a.release.MarkManagedPipelineProcessingFailed(condition.Message)
+		var message string
+		if pipelineRun.GetDeletionTimestamp() != nil && condition.IsUnknown() {
+			message = "PipelineRun was deleted while still running"
+		} else {
+			var err error
+			message, err = a.getFailedTaskRunLogs(pipelineRun)
+			if err != nil {
+				a.logger.Error(err, "failed to get TaskRun logs for managed pipeline")
+			}
+			if message == "" {
+				message = condition.Message
+			}
+		}
+		a.release.MarkManagedPipelineProcessingFailed(message)
 		a.release.MarkReleaseFailed("Release processing failed on managed pipelineRun")
 	}
 
@@ -1277,7 +1726,7 @@ func (a *adapter) registerManagedProcessingStatus(pipelineRun *tektonv1.Pipeline
 // associated final Release PipelineRun and setting the appropriate state in the Release. If the PipelineRun hasn't
 // started/succeeded, no action will be taken.
 func (a *adapter) registerFinalProcessingStatus(pipelineRun *tektonv1.PipelineRun) error {
-	if pipelineRun == nil || !pipelineRun.IsDone() {
+	if pipelineRun == nil || !tekton.IsPipelineRunDone(pipelineRun) {
 		return nil
 	}
 
@@ -1287,36 +1736,42 @@ func (a *adapter) registerFinalProcessingStatus(pipelineRun *tektonv1.PipelineRu
 	if condition.IsTrue() {
 		a.release.MarkFinalPipelineProcessed()
 	} else {
-		a.release.MarkFinalPipelineProcessingFailed(condition.Message)
+		var message string
+		if pipelineRun.GetDeletionTimestamp() != nil && condition.IsUnknown() {
+			message = "PipelineRun was deleted while still running"
+		} else {
+			var err error
+			message, err = a.getFailedTaskRunLogs(pipelineRun)
+			if err != nil {
+				a.logger.Error(err, "failed to get TaskRun logs for final pipeline")
+			}
+			if message == "" {
+				message = condition.Message
+			}
+		}
+		a.release.MarkFinalPipelineProcessingFailed(message)
 		a.release.MarkReleaseFailed("Release processing failed on final pipelineRun")
 	}
 
 	return a.client.Status().Patch(a.ctx, a.release, patch)
 }
 
-// validateApplication will ensure that the same Application is used in both, the Snapshot and the ReleasePlan. If the
-// resources reference different Applications, an error will be returned.
+// validateApplication will ensure that the same Application is used in both the Snapshot and the ReleasePlan. If the
+// resources reference different Applications, the Release will be marked as invalid.
 func (a *adapter) validateApplication() *controller.ValidationResult {
 	releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			a.release.MarkValidationFailed(err.Error())
-			return &controller.ValidationResult{Valid: false}
-		}
-		return &controller.ValidationResult{Err: err}
+		return a.validationError(err)
 	}
 
 	snapshot, err := a.loader.GetSnapshot(a.ctx, a.client, a.release)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			a.release.MarkValidationFailed(err.Error())
-			return &controller.ValidationResult{Valid: false}
-		}
-		return &controller.ValidationResult{Err: err}
+		return a.validationError(err)
 	}
 
 	if releasePlan.Spec.Application != snapshot.Spec.Application {
-		return &controller.ValidationResult{Err: fmt.Errorf("different Application referenced in ReleasePlan and Snapshot")}
+		a.release.MarkValidationFailed("different Application referenced in ReleasePlan and Snapshot")
+		return &controller.ValidationResult{Valid: false}
 	}
 
 	return &controller.ValidationResult{Valid: true}
@@ -1341,11 +1796,7 @@ func (a *adapter) validateAuthor() *controller.ValidationResult {
 
 	releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			a.release.MarkValidationFailed(err.Error())
-			return &controller.ValidationResult{Valid: false}
-		}
-		return &controller.ValidationResult{Err: err}
+		return a.validationError(err)
 	}
 
 	var author string
@@ -1373,22 +1824,13 @@ func (a *adapter) validateAuthor() *controller.ValidationResult {
 func (a *adapter) validateProcessingResources() *controller.ValidationResult {
 	releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			a.release.MarkValidationFailed(err.Error())
-			return &controller.ValidationResult{Valid: false}
-		}
-		return &controller.ValidationResult{Err: err}
+		return a.validationError(err)
 	}
 
 	if releasePlan.Spec.TenantPipeline == nil {
-		resources, err := a.loader.GetProcessingResources(a.ctx, a.client, a.release)
+		_, err := a.loader.GetProcessingResources(a.ctx, a.client, a.release)
 		if err != nil {
-			if resources == nil || resources.ReleasePlan == nil || resources.ReleasePlanAdmission == nil || errors.IsNotFound(err) {
-				a.release.MarkValidationFailed(err.Error())
-				return &controller.ValidationResult{Valid: false}
-			}
-
-			return &controller.ValidationResult{Err: err}
+			return a.validationError(err)
 		}
 	}
 	return &controller.ValidationResult{Valid: true}
@@ -1440,12 +1882,7 @@ func (a *adapter) validatePipelineSource() *controller.ValidationResult {
 func (a *adapter) validatePipelineDefined() *controller.ValidationResult {
 	releasePlan, err := a.loader.GetReleasePlan(a.ctx, a.client, a.release)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			a.release.MarkValidationFailed(err.Error())
-			return &controller.ValidationResult{Valid: false}
-		}
-
-		return &controller.ValidationResult{Err: err}
+		return a.validationError(err)
 	}
 
 	if releasePlan.Spec.Target == "" {
@@ -1462,12 +1899,7 @@ func (a *adapter) validatePipelineDefined() *controller.ValidationResult {
 		}
 		releasePlanAdmission, err := a.loader.GetActiveReleasePlanAdmissionFromRelease(a.ctx, a.client, a.release)
 		if err != nil {
-			if errors.IsNotFound(err) || strings.Contains(err.Error(), "with auto-release label set to false") {
-				a.release.MarkValidationFailed(err.Error())
-				return &controller.ValidationResult{Valid: false}
-			}
-
-			return &controller.ValidationResult{Err: err}
+			return a.validationError(err)
 		}
 		if releasePlanAdmission.Spec.Pipeline == nil {
 			errString := "releasePlan and releasePlanAdmission both have no pipeline. Each Release should define a tenant pipeline, managed pipeline, or both"
@@ -1482,9 +1914,107 @@ func (a *adapter) validatePipelineDefined() *controller.ValidationResult {
 // validationError checks the error type, marks the release as failed when the error for known errors, and returns the
 // ValidationResult for the error found.
 func (a *adapter) validationError(err error) *controller.ValidationResult {
-	if errors.IsNotFound(err) {
-		a.release.MarkValidationFailed(err.Error())
-		return &controller.ValidationResult{Valid: false}
+	// Retriable errors should trigger requeue, not validation failure
+	if loader.IsRetriable(err) {
+		return &controller.ValidationResult{Err: err}
 	}
-	return &controller.ValidationResult{Err: err}
+	// All other errors (NotFound, config errors, etc.) are permanent validation failures
+	a.release.MarkValidationFailed(err.Error())
+	return &controller.ValidationResult{Valid: false}
+}
+
+// maxConditionMessageLength is the maximum length for a Kubernetes condition message.
+// This limit is enforced by the API server validation (MaxLength=32768).
+const maxConditionMessageLength = 31000
+
+// getFailedTaskRunLogs returns the logs from the first failed TaskRun in the PipelineRun.
+// If no failed TaskRun is found, it returns an empty string and nil error.
+// If logs cannot be retrieved, an error is returned along with the condition message as fallback.
+func (a *adapter) getFailedTaskRunLogs(pipelineRun *tektonv1.PipelineRun) (string, error) {
+	if pipelineRun == nil {
+		return "", nil
+	}
+
+	taskRunList := &tektonv1.TaskRunList{}
+	err := a.client.List(a.ctx, taskRunList,
+		client.InNamespace(pipelineRun.Namespace),
+		client.MatchingLabels{
+			"tekton.dev/pipelineRun": pipelineRun.Name,
+		},
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to list TaskRuns: %w", err)
+	}
+
+	// Build a map for quick lookup by name
+	taskRunMap := make(map[string]*tektonv1.TaskRun, len(taskRunList.Items))
+	for i := range taskRunList.Items {
+		taskRunMap[taskRunList.Items[i].Name] = &taskRunList.Items[i]
+	}
+
+	// Iterate in the same order as ChildReferences to maintain consistent behavior
+	for _, childRef := range pipelineRun.Status.ChildReferences {
+		if childRef.Kind != "TaskRun" {
+			continue
+		}
+
+		taskRun, exists := taskRunMap[childRef.Name]
+		if !exists {
+			continue
+		}
+
+		condition := taskRun.Status.GetCondition(apis.ConditionSucceeded)
+		if condition != nil && condition.IsFalse() {
+			prefix := fmt.Sprintf("task %s failed: ", childRef.PipelineTaskName)
+			maxLen := maxConditionMessageLength - len(prefix)
+			truncationMarker := "...(truncated)\n"
+
+			message, err := a.getTaskRunLogs(taskRun)
+			if message == "" {
+				message = condition.Message
+			}
+
+			if len(message) > maxLen {
+				startIdx := len(message) - maxLen + len(truncationMarker)
+				if startIdx < 0 {
+					startIdx = 0
+				} else if startIdx >= len(message) {
+					startIdx = len(message)
+				}
+				message = truncationMarker + message[startIdx:]
+			}
+			return prefix + message, err
+		}
+	}
+
+	return "", nil
+}
+
+// getTaskRunLogs fetches the logs from the pod associated with the TaskRun.
+func (a *adapter) getTaskRunLogs(taskRun *tektonv1.TaskRun) (string, error) {
+	if taskRun.Status.PodName == "" {
+		return "", nil
+	}
+
+	config := ctrl.GetConfigOrDie()
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	req := clientset.CoreV1().Pods(taskRun.Namespace).GetLogs(taskRun.Status.PodName, &corev1.PodLogOptions{
+		TailLines: ptr.To(int64(500)),
+	})
+	stream, err := req.Stream(a.ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to stream pod logs: %w", err)
+	}
+	defer stream.Close()
+
+	logs, err := io.ReadAll(stream)
+	if err != nil {
+		return "", fmt.Errorf("failed to read pod logs: %w", err)
+	}
+
+	return string(logs), nil
 }

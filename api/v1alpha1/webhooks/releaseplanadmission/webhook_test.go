@@ -66,8 +66,8 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 		Expect(err == nil || errors.IsNotFound(err)).To(BeTrue())
 	})
 
-	When("a ReleasePlanAdmission is created without the auto-release label", func() {
-		It("should get the label added with its value set to true", func() {
+	When("a ReleasePlanAdmission is created without the block-releases label", func() {
+		It("should get the label added with its value set to false", func() {
 			Expect(k8sClient.Create(ctx, releasePlanAdmission)).Should(Succeed())
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{
@@ -75,27 +75,27 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 					Namespace: releasePlanAdmission.Namespace,
 				}, releasePlanAdmission)
 
-				labelValue, ok := releasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]
+				labelValue, ok := releasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel]
 
-				return err == nil && ok && labelValue == "true"
+				return err == nil && ok && labelValue == "false"
 			}, timeout).Should(BeTrue())
 		})
 	})
 
-	When("a ReleasePlanAdmission is created with an invalid auto-release label value", func() {
+	When("a ReleasePlanAdmission is created with an invalid block-releases label value", func() {
 		It("should get rejected until the value is valid", func() {
-			releasePlanAdmission.Labels = map[string]string{metadata.AutoReleaseLabel: "foo"}
+			releasePlanAdmission.Labels = map[string]string{metadata.BlockReleasesLabel: "foo"}
 			err := k8sClient.Create(ctx, releasePlanAdmission)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.AutoReleaseLabel))
+			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.BlockReleasesLabel))
 		})
 	})
 
-	When("a ReleasePlanAdmission is created with a valid auto-release label value", func() {
+	When("a ReleasePlanAdmission is created with a valid block-releases label value", func() {
 		It("shouldn't be modified", func() {
 			By("setting label to true")
 			localReleasePlanAdmission := releasePlanAdmission.DeepCopy()
-			localReleasePlanAdmission.Labels = map[string]string{metadata.AutoReleaseLabel: "true"}
+			localReleasePlanAdmission.Labels = map[string]string{metadata.BlockReleasesLabel: "true"}
 			Expect(k8sClient.Create(ctx, localReleasePlanAdmission)).Should(Succeed())
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{
@@ -103,7 +103,7 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 					Namespace: localReleasePlanAdmission.Namespace,
 				}, localReleasePlanAdmission)
 
-				labelValue, ok := localReleasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]
+				labelValue, ok := localReleasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel]
 
 				return err == nil && ok && labelValue == "true"
 			}, timeout).Should(BeTrue())
@@ -112,7 +112,7 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 
 			By("setting label to false")
 			localReleasePlanAdmission = releasePlanAdmission.DeepCopy()
-			localReleasePlanAdmission.Labels = map[string]string{metadata.AutoReleaseLabel: "false"}
+			localReleasePlanAdmission.Labels = map[string]string{metadata.BlockReleasesLabel: "false"}
 			Expect(k8sClient.Create(ctx, localReleasePlanAdmission)).Should(Succeed())
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{
@@ -120,20 +120,20 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 					Namespace: localReleasePlanAdmission.Namespace,
 				}, localReleasePlanAdmission)
 
-				labelValue, ok := localReleasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel]
+				labelValue, ok := localReleasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel]
 
 				return err == nil && ok && labelValue == "false"
 			}, timeout).Should(BeTrue())
 		})
 	})
 
-	When("a ReleasePlanAdmission is updated using an invalid auto-release label value", func() {
+	When("a ReleasePlanAdmission is updated using an invalid block-releases label value", func() {
 		It("shouldn't be modified", func() {
 			Expect(k8sClient.Create(ctx, releasePlanAdmission)).Should(Succeed())
-			releasePlanAdmission.GetLabels()[metadata.AutoReleaseLabel] = "foo"
+			releasePlanAdmission.GetLabels()[metadata.BlockReleasesLabel] = "foo"
 			err := k8sClient.Update(ctx, releasePlanAdmission)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.AutoReleaseLabel))
+			Expect(err.Error()).To(ContainSubstring("'%s' label can only be set to true or false", metadata.BlockReleasesLabel))
 		})
 	})
 
@@ -141,6 +141,73 @@ var _ = Describe("ReleasePlanAdmission webhook", func() {
 		It("should return nil", func() {
 			releasePlanAdmission := &v1alpha1.ReleasePlanAdmission{}
 			Expect(webhook.ValidateDelete(ctx, releasePlanAdmission)).To(BeNil())
+		})
+	})
+
+	When("a ReleasePlanAdmission is created with an application name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			releasePlanAdmission.Spec.Applications = []string{
+				"valid-app",
+				"this-is-a-very-long-application-name-that-exceeds-sixty-three-chars",
+			}
+			err := k8sClient.Create(ctx, releasePlanAdmission)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("application name"))
+			Expect(err.Error()).To(ContainSubstring("must be no more than 63 characters"))
+		})
+	})
+
+	When("a ReleasePlanAdmission is updated with an application name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			Expect(k8sClient.Create(ctx, releasePlanAdmission)).Should(Succeed())
+			releasePlanAdmission.Spec.Applications = []string{
+				"this-is-a-very-long-application-name-that-exceeds-sixty-three-chars",
+			}
+			err := k8sClient.Update(ctx, releasePlanAdmission)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("application name"))
+			Expect(err.Error()).To(ContainSubstring("must be no more than 63 characters"))
+		})
+	})
+
+	When("a ReleasePlanAdmission is created with a componentGroup name longer than 63 characters", func() {
+		It("should be rejected", func() {
+			releasePlanAdmission.Spec.Applications = nil
+			releasePlanAdmission.Spec.ComponentGroups = []string{
+				"this-is-a-very-long-component-group-name-that-exceeds-sixty-three-chars",
+			}
+			err := k8sClient.Create(ctx, releasePlanAdmission)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("componentGroup name"))
+			Expect(err.Error()).To(ContainSubstring("must be no more than 63 characters"))
+		})
+	})
+
+	When("a ReleasePlanAdmission is created with both applications and componentGroups", func() {
+		It("should be rejected", func() {
+			releasePlanAdmission.Spec.Applications = []string{"app"}
+			releasePlanAdmission.Spec.ComponentGroups = []string{"group"}
+			err := k8sClient.Create(ctx, releasePlanAdmission)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of applications or componentGroups must be specified"))
+		})
+	})
+
+	When("a ReleasePlanAdmission is created with neither applications nor componentGroups", func() {
+		It("should be rejected", func() {
+			releasePlanAdmission.Spec.Applications = nil
+			releasePlanAdmission.Spec.ComponentGroups = nil
+			err := k8sClient.Create(ctx, releasePlanAdmission)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of applications or componentGroups must be specified"))
+		})
+	})
+
+	When("a ReleasePlanAdmission is created with only componentGroups", func() {
+		It("should succeed", func() {
+			releasePlanAdmission.Spec.Applications = nil
+			releasePlanAdmission.Spec.ComponentGroups = []string{"my-component-group"}
+			Expect(k8sClient.Create(ctx, releasePlanAdmission)).Should(Succeed())
 		})
 	})
 })

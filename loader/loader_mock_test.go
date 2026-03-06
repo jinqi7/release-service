@@ -3,12 +3,12 @@ package loader
 import (
 	toolkit "github.com/konflux-ci/operator-toolkit/loader"
 
-	v1alpha12 "github.com/enterprise-contract/enterprise-contract-controller/api/v1alpha1"
+	v1alpha12 "github.com/conforma/crds/api/v1alpha1"
+	applicationapiv1alpha1 "github.com/konflux-ci/application-api/api/v1alpha1"
 	"github.com/konflux-ci/release-service/api/v1alpha1"
 	"github.com/konflux-ci/release-service/metadata"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	applicationapiv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	rbac "k8s.io/api/rbac/v1"
 )
@@ -142,8 +142,8 @@ var _ = Describe("Release Adapter", Ordered, func() {
 		})
 	})
 
-	When("calling GetRoleBindingFromReleaseStatus", func() {
-		It("returns the resource and error from the context", func() {
+	When("calling GetRoleBindingFromReleaseStatusPipelineInfo", func() {
+		It("returns the tenant resource and error from the context", func() {
 			roleBinding := &rbac.RoleBinding{}
 			mockContext := toolkit.GetMockedContext(ctx, []toolkit.MockData{
 				{
@@ -151,7 +151,33 @@ var _ = Describe("Release Adapter", Ordered, func() {
 					Resource:   roleBinding,
 				},
 			})
-			resource, err := loader.GetRoleBindingFromReleaseStatus(mockContext, nil, nil)
+			resource, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(mockContext, nil, nil, "tenant")
+			Expect(resource).To(Equal(roleBinding))
+			Expect(err).To(BeNil())
+		})
+
+		It("returns the managed resource and error from the context", func() {
+			roleBinding := &rbac.RoleBinding{}
+			mockContext := toolkit.GetMockedContext(ctx, []toolkit.MockData{
+				{
+					ContextKey: RoleBindingContextKey,
+					Resource:   roleBinding,
+				},
+			})
+			resource, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(mockContext, nil, nil, "managed")
+			Expect(resource).To(Equal(roleBinding))
+			Expect(err).To(BeNil())
+		})
+
+		It("returns the secret resource and error from the context", func() {
+			roleBinding := &rbac.RoleBinding{}
+			mockContext := toolkit.GetMockedContext(ctx, []toolkit.MockData{
+				{
+					ContextKey: RoleBindingContextKey,
+					Resource:   roleBinding,
+				},
+			})
+			resource, err := loader.GetRoleBindingFromReleaseStatusPipelineInfo(mockContext, nil, nil, "secret")
 			Expect(resource).To(Equal(roleBinding))
 			Expect(err).To(BeNil())
 		})

@@ -53,6 +53,8 @@ type Controller struct {
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=releaseserviceconfigs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=internalrequests,verbs=create;delete;get;list;watch
 //InternalRequests RBAC is required to prevent `forbidden: user system:serviceaccount:release-service:release-service-controller-manager
 //is attempting to grant RBAC permissions not currently held`
@@ -77,6 +79,8 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return controller.ReconcileHandler([]controller.Operation{
 		adapter.EnsureFinalizersAreCalled,
 		adapter.EnsureConfigIsLoaded, // This operation sets the config in the adapter to be used in other operations.
+		adapter.EnsureCollectorsProcessingResourcesAreCleanedUp,
+		adapter.EnsureReleaseProcessingResourcesAreCleanedUp,
 		adapter.EnsureReleaseIsRunning,
 		adapter.EnsureReleaseIsValid,
 		adapter.EnsureApplicationMetadataIsSet,
@@ -92,7 +96,6 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		adapter.EnsureManagedPipelineProcessingIsTracked,
 		adapter.EnsureFinalPipelineIsProcessed,
 		adapter.EnsureFinalPipelineProcessingIsTracked,
-		adapter.EnsureReleaseProcessingResourcesAreCleanedUp,
 		adapter.EnsureReleaseIsCompleted,
 	})
 }
@@ -111,7 +114,7 @@ func (c *Controller) Register(mgr ctrl.Manager, log *logr.Logger, _ cluster.Clus
 				Kind:  "Release",
 				Group: "appstudio.redhat.com",
 			},
-		}, builder.WithPredicates(tekton.ReleasePipelineRunSucceededPredicate())).
+		}, builder.WithPredicates(tekton.ReleasePipelineRunLifecyclePredicate())).
 		Complete(c)
 }
 
