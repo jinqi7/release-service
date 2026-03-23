@@ -6190,3 +6190,65 @@ var _ = Describe("Release adapter", Ordered, func() {
 		Expect(k8sClient.Delete(ctx, snapshot)).To(Succeed())
 	}
 })
+
+var _ = Describe("isAdmissionWebhookError", func() {
+	It("returns false for nil error", func() {
+		Expect(isAdmissionWebhookError(nil)).To(BeFalse())
+	})
+
+	It("returns false for non-admission webhook errors", func() {
+		err := fmt.Errorf("some random error")
+		Expect(isAdmissionWebhookError(err)).To(BeFalse())
+	})
+
+	It("returns false for errors without 'denied the request' text", func() {
+		err := errors.NewInvalid(
+			schema.GroupKind{Group: "tekton.dev", Kind: "PipelineRun"},
+			"test-pipeline",
+			nil,
+		)
+		wrappedErr := fmt.Errorf("admission webhook failed: %w", err)
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeFalse())
+	})
+
+	It("returns false for errors without 'admission webhook' text", func() {
+		err := errors.NewInvalid(
+			schema.GroupKind{Group: "tekton.dev", Kind: "PipelineRun"},
+			"test-pipeline",
+			nil,
+		)
+		wrappedErr := fmt.Errorf("request denied the request: %w", err)
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeFalse())
+	})
+
+	It("returns true for Invalid errors with admission webhook denial message", func() {
+		err := errors.NewInvalid(
+			schema.GroupKind{Group: "tekton.dev", Kind: "PipelineRun"},
+			"test-pipeline",
+			nil,
+		)
+		wrappedErr := fmt.Errorf("admission webhook \"pipelinerun-kueue-defaulter.tekton-kueue.io\" denied the request: %w", err)
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeTrue())
+	})
+
+	It("returns true for BadRequest errors with admission webhook denial message", func() {
+		err := errors.NewBadRequest("invalid timeout configuration")
+		wrappedErr := fmt.Errorf("admission webhook \"validator.example.com\" denied the request: %w", err)
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeTrue())
+	})
+
+	It("returns true for Forbidden errors with admission webhook denial message", func() {
+		err := errors.NewForbidden(
+			schema.GroupResource{Group: "tekton.dev", Resource: "pipelineruns"},
+			"test-pipeline",
+			fmt.Errorf("forbidden by policy"),
+		)
+		wrappedErr := fmt.Errorf("admission webhook \"policy-enforcer.example.com\" denied the request: %w", err)
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeTrue())
+	})
+
+	It("returns true for real-world Kueue webhook error format", func() {
+		wrappedErr := fmt.Errorf("admission webhook \"pipelinerun-kueue-defaulter.tekton-kueue.io\" denied the request: invalid value: 8h0m0s + 10m0s should be <= pipeline duration: timeouts.finally, timeouts.tasks")
+		Expect(isAdmissionWebhookError(wrappedErr)).To(BeTrue())
+	})
+})

@@ -277,7 +277,21 @@ func (a *adapter) EnsureManagedCollectorsPipelineIsProcessed() (controller.Opera
 
 			pipelineRun, err = a.createManagedCollectorsPipelineRun(releasePlanAdmission)
 			if err != nil {
-				return controller.RequeueWithError(err)
+				if isAdmissionWebhookError(err) {
+					patch := client.MergeFrom(a.release.DeepCopy())
+					a.release.MarkManagedCollectorsPipelineProcessingFailed(err.Error())
+					a.release.MarkReleaseFailed("Release processing failed: admission webhook denied managed collectors PipelineRun creation")
+					return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
+				}
+
+				if loader.IsRetriable(err) {
+					return controller.RequeueWithError(err)
+				}
+
+				patch := client.MergeFrom(a.release.DeepCopy())
+				a.release.MarkManagedCollectorsPipelineProcessingFailed(err.Error())
+				a.release.MarkReleaseFailed("Release processing failed on managed collectors PipelineRun creation")
+				return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
 			}
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.ManagedCollectorsPipelineType),
@@ -371,7 +385,21 @@ func (a *adapter) EnsureTenantCollectorsPipelineIsProcessed() (controller.Operat
 
 			pipelineRun, err = a.createTenantCollectorsPipelineRun(releasePlan, releasePlanAdmission)
 			if err != nil {
-				return controller.RequeueWithError(err)
+				if isAdmissionWebhookError(err) {
+					patch := client.MergeFrom(a.release.DeepCopy())
+					a.release.MarkTenantCollectorsPipelineProcessingFailed(err.Error())
+					a.release.MarkReleaseFailed("Release processing failed: admission webhook denied tenant collectors PipelineRun creation")
+					return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
+				}
+
+				if loader.IsRetriable(err) {
+					return controller.RequeueWithError(err)
+				}
+
+				patch := client.MergeFrom(a.release.DeepCopy())
+				a.release.MarkTenantCollectorsPipelineProcessingFailed(err.Error())
+				a.release.MarkReleaseFailed("Release processing failed on tenant collectors PipelineRun creation")
+				return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
 			}
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.TenantCollectorsPipelineType),
@@ -445,7 +473,21 @@ func (a *adapter) EnsureTenantPipelineIsProcessed() (controller.OperationResult,
 
 			pipelineRun, err = a.createTenantPipelineRun(releasePlan, snapshot)
 			if err != nil {
-				return controller.RequeueWithError(err)
+				if isAdmissionWebhookError(err) {
+					patch := client.MergeFrom(a.release.DeepCopy())
+					a.release.MarkTenantPipelineProcessingFailed(err.Error())
+					a.release.MarkReleaseFailed("Release processing failed: admission webhook denied tenant PipelineRun creation")
+					return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
+				}
+
+				if loader.IsRetriable(err) {
+					return controller.RequeueWithError(err)
+				}
+
+				patch := client.MergeFrom(a.release.DeepCopy())
+				a.release.MarkTenantPipelineProcessingFailed(err.Error())
+				a.release.MarkReleaseFailed("Release processing failed on tenant PipelineRun creation")
+				return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
 			}
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.TenantPipelineType),
@@ -514,7 +556,21 @@ func (a *adapter) EnsureManagedPipelineIsProcessed() (controller.OperationResult
 
 			pipelineRun, err = a.createManagedPipelineRun(resources)
 			if err != nil {
-				return controller.RequeueWithError(err)
+				if isAdmissionWebhookError(err) {
+					patch := client.MergeFrom(a.release.DeepCopy())
+					a.release.MarkManagedPipelineProcessingFailed(err.Error())
+					a.release.MarkReleaseFailed("Release processing failed: admission webhook denied managed PipelineRun creation")
+					return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
+				}
+
+				if loader.IsRetriable(err) {
+					return controller.RequeueWithError(err)
+				}
+
+				patch := client.MergeFrom(a.release.DeepCopy())
+				a.release.MarkManagedPipelineProcessingFailed(err.Error())
+				a.release.MarkReleaseFailed("Release processing failed on managed PipelineRun creation")
+				return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
 			}
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.ManagedPipelineType),
@@ -560,7 +616,21 @@ func (a *adapter) EnsureFinalPipelineIsProcessed() (controller.OperationResult, 
 
 			pipelineRun, err = a.createFinalPipelineRun(releasePlan, snapshot)
 			if err != nil {
-				return controller.RequeueWithError(err)
+				if isAdmissionWebhookError(err) {
+					patch := client.MergeFrom(a.release.DeepCopy())
+					a.release.MarkFinalPipelineProcessingFailed(err.Error())
+					a.release.MarkReleaseFailed("Release processing failed: admission webhook denied final PipelineRun creation")
+					return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
+				}
+
+				if loader.IsRetriable(err) {
+					return controller.RequeueWithError(err)
+				}
+
+				patch := client.MergeFrom(a.release.DeepCopy())
+				a.release.MarkFinalPipelineProcessingFailed(err.Error())
+				a.release.MarkReleaseFailed("Release processing failed on final PipelineRun creation")
+				return controller.RequeueOnErrorOrStop(a.client.Status().Patch(a.ctx, a.release, patch))
 			}
 
 			a.logger.Info(fmt.Sprintf("Created %s Release PipelineRun", metadata.FinalPipelineType),
@@ -2017,4 +2087,22 @@ func (a *adapter) getTaskRunLogs(taskRun *tektonv1.TaskRun) (string, error) {
 	}
 
 	return string(logs), nil
+}
+
+// isAdmissionWebhookError checks if an error is caused by an admission webhook denial.
+// Admission webhook errors are permanent errors that should immediately fail the Release
+// rather than being retried indefinitely.
+func isAdmissionWebhookError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check if the error is one of the status types that admission webhooks typically return
+	if !errors.IsInvalid(err) && !errors.IsBadRequest(err) && !errors.IsForbidden(err) {
+		return false
+	}
+
+	// Check if the error message contains webhook-related keywords
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "admission webhook") && strings.Contains(errMsg, "denied the request")
 }
